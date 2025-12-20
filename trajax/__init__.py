@@ -16,3 +16,7 @@
 
 from . import integrators
 from . import optimizers
+
+from . import torch
+
+__all__ = ['integrators', 'optimizers', 'torch']
