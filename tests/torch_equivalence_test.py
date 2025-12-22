@@ -19,6 +19,7 @@ import numpy as onp
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+import jax.random as jrandom
 import jax.numpy as jnp
 import torch
 
@@ -220,6 +221,195 @@ class TorchEquivalenceTest(parameterized.TestCase):
                                 atol=1e-5)
     self.assertEqual(K_t.device.type, self.device.type)
     self.assertEqual(k_t.device.type, self.device.type)
+
+  def test_ilqr_parity(self):
+    T, n, m = 5, 3, 2
+    A = onp.random.randn(n, n).astype(onp.float32)
+    B = onp.random.randn(n, m).astype(onp.float32)
+    Q = jnp.eye(n, dtype=jnp.float32)
+    R = jnp.eye(m, dtype=jnp.float32)
+
+    def dynamics_jax(x, u, t):
+      del t
+      return A @ x + B @ u
+
+    def cost_jax(x, u, t):
+      del t
+      return 0.5 * x.T @ (Q @ x) + 0.1 * u.T @ (R @ u)
+
+    def dynamics_torch(x, u, t):
+      del t
+      return torch.tensor(A, device=self.device) @ x + torch.tensor(
+          B, device=self.device) @ u
+
+    def cost_torch(x, u, t):
+      del t
+      return 0.5 * torch.dot(x, torch.matmul(torch.eye(n, device=self.device),
+                                             x)) + 0.1 * torch.dot(
+                                                 u, torch.matmul(
+                                                     torch.eye(
+                                                         m, device=self.device),
+                                                     u))
+
+    x0_np = jnp.array(onp.random.randn(n), dtype=jnp.float32)
+    U_np = jnp.zeros((T, m), dtype=jnp.float32)
+    x0_torch = torch.tensor(onp.asarray(x0_np), device=self.device,
+                            dtype=torch.float32)
+    U_torch = torch.zeros((T, m), device=self.device, dtype=torch.float32)
+
+    X_jax, U_jax, obj_jax, *_ = jax_optimizers.ilqr(
+        cost_jax, dynamics_jax, x0_np, U_np, maxiter=10, make_psd=True)
+
+    X_torch, U_torch_opt, obj_torch, *_ = torch_optimizers.ilqr(
+        cost_torch, dynamics_torch, x0_torch, U_torch, maxiter=10,
+        make_psd=True)
+
+    onp.testing.assert_allclose(X_jax, X_torch.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(U_jax, U_torch_opt.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(obj_jax, obj_torch.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+
+  def test_random_shooting_parity(self):
+    T, n, m = 3, 2, 1
+    A = onp.random.randn(n, n).astype(onp.float32)
+    B = onp.random.randn(n, m).astype(onp.float32)
+    Q = jnp.eye(n, dtype=jnp.float32)
+    R = jnp.eye(m, dtype=jnp.float32)
+
+    def dynamics_jax(x, u, t):
+      del t
+      return A @ x + B @ u
+
+    def cost_jax(x, u, t):
+      del t
+      return 0.5 * x.T @ (Q @ x) + 0.1 * u.T @ (R @ u)
+
+    def dynamics_torch(x, u, t):
+      del t
+      return torch.tensor(A, device=self.device) @ x + torch.tensor(
+          B, device=self.device) @ u
+
+    def cost_torch(x, u, t):
+      del t
+      return 0.5 * torch.dot(x, torch.matmul(torch.eye(n, device=self.device),
+                                             x)) + 0.1 * torch.dot(
+                                                 u, torch.matmul(
+                                                     torch.eye(
+                                                         m, device=self.device),
+                                                     u))
+
+    x0_np = jnp.array(onp.random.randn(n), dtype=jnp.float32)
+    x0_torch = torch.tensor(onp.asarray(x0_np), device=self.device,
+                            dtype=torch.float32)
+    init_controls_np = jnp.zeros((T, m), dtype=jnp.float32)
+    init_controls_torch = torch.zeros((T, m), device=self.device,
+                                      dtype=torch.float32)
+    control_low_np = jnp.zeros((T, m), dtype=jnp.float32)
+    control_high_np = jnp.zeros((T, m), dtype=jnp.float32)
+    control_low_torch = torch.zeros((T, m), device=self.device,
+                                    dtype=torch.float32)
+    control_high_torch = torch.zeros((T, m), device=self.device,
+                                     dtype=torch.float32)
+    expected_X = jax_optimizers.rollout(dynamics_jax, init_controls_np, x0_np)
+    expected_obj = jax_optimizers.objective(cost_jax, dynamics_jax,
+                                            init_controls_np, x0_np)
+
+    X_torch, U_torch_opt, obj_torch = torch_optimizers.random_shooting(
+        cost_torch, dynamics_torch, x0_torch, init_controls_torch,
+        control_low_torch, control_high_torch, generator=None,
+        hyperparams=None)
+
+    onp.testing.assert_allclose(expected_X, X_torch.detach().cpu().numpy(),
+                                rtol=1e-5, atol=1e-5)
+    onp.testing.assert_allclose(init_controls_np,
+                                U_torch_opt.detach().cpu().numpy(),
+                                rtol=1e-5, atol=1e-5)
+    onp.testing.assert_allclose(expected_obj, obj_torch.detach().cpu().numpy(),
+                                rtol=1e-5, atol=1e-5)
+
+  def test_cem_parity(self):
+    T, n, m = 3, 2, 1
+    A = onp.random.randn(n, n).astype(onp.float32)
+    B = onp.random.randn(n, m).astype(onp.float32)
+    Q = jnp.eye(n, dtype=jnp.float32)
+    R = jnp.eye(m, dtype=jnp.float32)
+
+    def dynamics_jax(x, u, t):
+      del t
+      return A @ x + B @ u
+
+    def cost_jax(x, u, t):
+      del t
+      return 0.5 * x.T @ (Q @ x) + 0.1 * u.T @ (R @ u)
+
+    def dynamics_torch(x, u, t):
+      del t
+      return torch.tensor(A, device=self.device) @ x + torch.tensor(
+          B, device=self.device) @ u
+
+    def cost_torch(x, u, t):
+      del t
+      return 0.5 * torch.dot(x, torch.matmul(torch.eye(n, device=self.device),
+                                             x)) + 0.1 * torch.dot(
+                                                 u, torch.matmul(
+                                                     torch.eye(
+                                                         m, device=self.device),
+                                                     u))
+
+    x0_np = jnp.array(onp.random.randn(n), dtype=jnp.float32)
+    x0_torch = torch.tensor(onp.asarray(x0_np), device=self.device,
+                            dtype=torch.float32)
+    init_controls_np = jnp.zeros((T, m), dtype=jnp.float32)
+    init_controls_torch = torch.zeros((T, m), device=self.device,
+                                      dtype=torch.float32)
+    control_low_np = jnp.zeros((T, m), dtype=jnp.float32)
+    control_high_np = jnp.zeros((T, m), dtype=jnp.float32)
+    control_low_torch = torch.zeros((T, m), device=self.device,
+                                    dtype=torch.float32)
+    control_high_torch = torch.zeros((T, m), device=self.device,
+                                     dtype=torch.float32)
+    expected_X = jax_optimizers.rollout(dynamics_jax, init_controls_np, x0_np)
+    expected_obj = jax_optimizers.objective(cost_jax, dynamics_jax,
+                                            init_controls_np, x0_np)
+
+    X_torch, U_torch_opt, obj_torch = torch_optimizers.cem(
+        cost_torch, dynamics_torch, x0_torch, init_controls_torch,
+        control_low_torch, control_high_torch, generator=None,
+        hyperparams=None)
+
+    onp.testing.assert_allclose(expected_X, X_torch.detach().cpu().numpy(),
+                                rtol=1e-5, atol=1e-5)
+    onp.testing.assert_allclose(init_controls_np,
+                                U_torch_opt.detach().cpu().numpy(),
+                                rtol=1e-5, atol=1e-5)
+    onp.testing.assert_allclose(expected_obj, obj_torch.detach().cpu().numpy(),
+                                rtol=1e-5, atol=1e-5)
+
+  def test_torch_ilqr_device_dtype_smoke(self):
+    T, n, m = 4, 2, 1
+    A = torch.eye(n, device=self.device, dtype=torch.float32)
+    B = torch.ones((n, m), device=self.device, dtype=torch.float32)
+
+    def dynamics_torch(x, u, t):
+      del t
+      return A @ x + B @ u
+
+    def cost_torch(x, u, t):
+      del t
+      return 0.5 * torch.dot(x, x) + 0.1 * torch.dot(u, u)
+
+    x0 = torch.ones((n,), device=self.device, dtype=torch.float32)
+    U0 = torch.zeros((T, m), device=self.device, dtype=torch.float32)
+
+    X, U, obj, grad, adjoints, _, _ = torch_optimizers.ilqr(
+        cost_torch, dynamics_torch, x0, U0, maxiter=5, make_psd=True)
+
+    self.assertEqual(X.device.type, self.device.type)
+    self.assertEqual(U.device.type, self.device.type)
+    self.assertEqual(obj.device.type, self.device.type)
+    self.assertEqual(grad.device.type, self.device.type)
 
 
 if __name__ == '__main__':

@@ -249,3 +249,103 @@ def ilqr(cost,
     iteration += 1
 
   return X, U, obj, gradient, adjoints, lqr, iteration
+
+
+# Sampling-based optimizers (CEM and random shooting)
+
+
+def default_cem_hyperparams():
+  return {
+      'sampling_smoothing': 0.,
+      'evolution_smoothing': 0.1,
+      'elite_portion': 0.1,
+      'max_iter': 10,
+      'num_samples': 400
+  }
+
+
+def gaussian_samples(generator, mean, stdev, control_low, control_high,
+                     hyperparams):
+  """Samples a batch of controls based on Gaussian distribution."""
+  device, dtype = mean.device, mean.dtype
+  if generator is None:
+    generator = torch.Generator(device=device)
+  num_samples = hyperparams['num_samples']
+  horizon, dim_control = mean.shape
+  noises = torch.randn(
+      (num_samples, horizon, dim_control), generator=generator, device=device,
+      dtype=mean.dtype)
+  smoothing_coef = hyperparams['sampling_smoothing']
+  for t in range(1, horizon):
+    noises[:, t] = (smoothing_coef * noises[:, t - 1] +
+                    torch.sqrt(torch.tensor(1 - smoothing_coef**2,
+                                             device=device, dtype=dtype)) *
+                    noises[:, t])
+  samples = noises * stdev + mean
+  control_low = control_low.unsqueeze(0).expand_as(samples)
+  control_high = control_high.unsqueeze(0).expand_as(samples)
+  samples = torch.max(torch.min(samples, control_high), control_low)
+  return samples
+
+
+def cem(cost,
+        dynamics,
+        init_state,
+        init_controls,
+        control_low,
+        control_high,
+        generator=None,
+        hyperparams=None):
+  """Cross Entropy Method implemented with PyTorch."""
+  if generator is None:
+    generator = torch.Generator(device=init_controls.device)
+  if hyperparams is None:
+    hyperparams = default_cem_hyperparams()
+  mean = init_controls.clone()
+  stdev = ((control_high - control_low) / 2.).clone()
+  obj_fn = partial(objective, cost, dynamics)
+
+  for _ in range(hyperparams['max_iter']):
+    controls = gaussian_samples(generator, mean, stdev, control_low,
+                                control_high, hyperparams)
+    costs = torch.stack([obj_fn(ctrls, init_state) for ctrls in controls])
+    num_elites = max(1, int(hyperparams['num_samples'] *
+                            hyperparams['elite_portion']))
+    elite_costs, elite_idx = torch.topk(costs, num_elites, largest=False)
+    elite_controls = controls[elite_idx]
+    new_mean = elite_controls.mean(dim=0)
+    new_stdev = elite_controls.std(dim=0)
+    mean = (hyperparams['evolution_smoothing'] * mean +
+            (1 - hyperparams['evolution_smoothing']) * new_mean)
+    stdev = (hyperparams['evolution_smoothing'] * stdev +
+             (1 - hyperparams['evolution_smoothing']) * new_stdev)
+
+  X = rollout(dynamics, mean, init_state)
+  obj = objective(cost, dynamics, mean, init_state)
+  return X, mean, obj
+
+
+def random_shooting(cost,
+                    dynamics,
+                    init_state,
+                    init_controls,
+                    control_low,
+                    control_high,
+                    generator=None,
+                    hyperparams=None):
+  """Random shooting method implemented with PyTorch."""
+  if generator is None:
+    generator = torch.Generator(device=init_controls.device)
+  if hyperparams is None:
+    hyperparams = default_cem_hyperparams()
+  mean = init_controls.clone()
+  stdev = ((control_high - control_low) / 2.).clone()
+  controls = gaussian_samples(generator, mean, stdev, control_low,
+                              control_high, hyperparams)
+  costs = torch.stack([objective(cost, dynamics, ctrls, init_state)
+                       for ctrls in controls])
+  best_idx = torch.argmin(costs)
+  U = controls[best_idx]
+  X = rollout(dynamics, mean, init_state)
+  obj = objective(cost, dynamics, mean, init_state)
+  return X, U, obj
