@@ -411,6 +411,88 @@ class TorchEquivalenceTest(parameterized.TestCase):
     self.assertEqual(obj.device.type, self.device.type)
     self.assertEqual(grad.device.type, self.device.type)
 
+  def test_constrained_ilqr_parity(self):
+    T, n, m = 3, 1, 1
+    A = 1.0
+    B = 1.0
+
+    def dynamics_jax(x, u, t):
+      del t
+      return A * x + B * u
+
+    def cost_jax(x, u, t):
+      del t
+      return 0.5 * jnp.sum(x**2) + 0.1 * jnp.sum(u**2)
+
+    def equality_constraint_jax(x, u, t):
+      del u, t
+      return x
+
+    def inequality_constraint_jax(x, u, t):
+      del x, u, t
+      return jnp.zeros(1, dtype=jnp.float32)
+
+    def dynamics_torch(x, u, t):
+      del t
+      return torch.tensor(A, device=self.device) * x + torch.tensor(
+          B, device=self.device) * u
+
+    def cost_torch(x, u, t):
+      del t
+      return 0.5 * torch.sum(x**2) + 0.1 * torch.sum(u**2)
+
+    def equality_constraint_torch(x, u, t):
+      del u, t
+      return x
+
+    def inequality_constraint_torch(x, u, t):
+      del x, u, t
+      return torch.zeros(1, device=self.device, dtype=torch.float32)
+
+    x0_np = jnp.array([1.0], dtype=jnp.float32)
+    U_np = jnp.zeros((T, m), dtype=jnp.float32)
+    x0_torch = torch.tensor(onp.asarray(x0_np), device=self.device,
+                            dtype=torch.float32)
+    U_torch = torch.zeros((T, m), device=self.device, dtype=torch.float32)
+
+    X_jax, U_jax, dual_eq_jax, dual_ineq_jax, penalty_jax, eq_constr_jax, ineq_constr_jax, max_violation_jax, obj_jax, grad_jax, iter_ilqr_jax, iter_al_jax = (
+        jax_optimizers.constrained_ilqr(
+            cost_jax,
+            dynamics_jax,
+            x0_np,
+            U_np,
+            equality_constraint=equality_constraint_jax,
+            inequality_constraint=inequality_constraint_jax,
+            maxiter_al=3,
+            maxiter_ilqr=10,
+            constraints_threshold=1e-4,
+            make_psd=True))
+
+    X_torch, U_torch_opt, dual_eq_torch, dual_ineq_torch, penalty_torch, eq_constr_torch, ineq_constr_torch, max_violation_torch, obj_torch, grad_torch, iter_ilqr_torch, iter_al_torch = (
+        torch_optimizers.constrained_ilqr(
+            cost_torch,
+            dynamics_torch,
+            x0_torch,
+            U_torch,
+            equality_constraint=equality_constraint_torch,
+            inequality_constraint=inequality_constraint_torch,
+            maxiter_al=3,
+            maxiter_ilqr=10,
+            constraints_threshold=1e-4,
+            make_psd=True))
+
+    onp.testing.assert_allclose(X_jax, X_torch.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(U_jax, U_torch_opt.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(eq_constr_jax,
+                                eq_constr_torch.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(obj_jax, obj_torch.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    self.assertEqual(X_torch.device.type, self.device.type)
+    self.assertEqual(U_torch_opt.device.type, self.device.type)
+
 
 if __name__ == '__main__':
   absltest.main()

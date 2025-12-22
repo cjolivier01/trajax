@@ -349,3 +349,128 @@ def random_shooting(cost,
   X = rollout(dynamics, mean, init_state)
   obj = objective(cost, dynamics, mean, init_state)
   return X, U, obj
+
+
+def constrained_ilqr(cost,
+                     dynamics,
+                     x0,
+                     U,
+                     equality_constraint=lambda x, u, t: torch.empty(
+                         0, device=x.device, dtype=x.dtype),
+                     inequality_constraint=lambda x, u, t: torch.empty(
+                         0, device=x.device, dtype=x.dtype),
+                     maxiter_al=5,
+                     maxiter_ilqr=100,
+                     grad_norm_threshold=1.0e-4,
+                     relative_grad_norm_threshold=0.0,
+                     obj_step_threshold=0.0,
+                     inputs_step_threshold=0.0,
+                     constraints_threshold=1.0e-2,
+                     penalty_init=1.0,
+                     penalty_update_rate=10.0,
+                     make_psd=True,
+                     psd_delta=0.0,
+                     alpha_0=1.0,
+                     alpha_min=0.00005):
+  """Constrained Iterative Linear Quadratic Regulator (PyTorch)."""
+
+  device, dtype = x0.device, x0.dtype
+  horizon = len(U) + 1
+  t_range = torch.arange(horizon, device=device)
+
+  X = rollout(dynamics, U, x0)
+
+  def augmented_lagrangian(x, u, t, dual_equality, dual_inequality, penalty):
+    J = cost(x, u, t)
+    equality = equality_constraint(x, u, t)
+    inequality = inequality_constraint(x, u, t)
+
+    if equality.numel():
+      J = J + torch.dot(dual_equality[t], equality)
+      J = J + 0.5 * penalty * torch.dot(equality, equality)
+
+    if inequality.numel():
+      active_set = torch.logical_not(
+          torch.isclose(dual_inequality[t],
+                        torch.tensor(0.0, device=device, dtype=dtype))
+          & (inequality < 0.0)).to(dtype)
+      J = J + torch.dot(dual_inequality[t], inequality)
+      J = J + 0.5 * penalty * torch.dot(active_set * inequality, inequality)
+
+    return J
+
+  def dual_update(constraint, dual, penalty):
+    return dual + penalty * constraint
+
+  def inequality_projection(dual):
+    return torch.maximum(dual, torch.tensor(0.0, device=device, dtype=dtype))
+
+  equality_constraint_mapped = vectorize(equality_constraint)
+  inequality_constraint_mapped = vectorize(inequality_constraint)
+
+  U_pad = pad(U)
+  equality_constraints = equality_constraint_mapped(X, U_pad, t_range)
+  inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
+
+  dual_equality = torch.zeros_like(equality_constraints)
+  dual_inequality = torch.zeros_like(inequality_constraints)
+
+  penalty = torch.tensor(penalty_init, device=device, dtype=dtype)
+
+  iteration_ilqr = 0
+  iteration_al = 0
+
+  def _safe_max_abs(x):
+    return torch.max(torch.abs(x)) if x.numel() else torch.tensor(
+        0.0, device=device, dtype=dtype)
+
+  while iteration_al < maxiter_al:
+    al_args = {
+        'dual_equality': dual_equality,
+        'dual_inequality': dual_inequality,
+        'penalty': penalty,
+    }
+
+    X, U, obj, gradient, _, _, iteration = ilqr(
+        partial(augmented_lagrangian, **al_args),
+        dynamics,
+        x0,
+        U,
+        maxiter=maxiter_ilqr,
+        grad_norm_threshold=grad_norm_threshold,
+        relative_grad_norm_threshold=relative_grad_norm_threshold,
+        obj_step_threshold=obj_step_threshold,
+        inputs_step_threshold=inputs_step_threshold,
+        make_psd=make_psd,
+        psd_delta=psd_delta,
+        alpha_0=alpha_0,
+        alpha_min=alpha_min)
+
+    U_pad = pad(U)
+    equality_constraints = equality_constraint_mapped(X, U_pad, t_range)
+    inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
+    inequality_constraints_projected = inequality_projection(inequality_constraints)
+
+    max_constraint_violation = torch.maximum(
+        _safe_max_abs(equality_constraints),
+        torch.max(inequality_constraints_projected) if inequality_constraints_projected.numel() else torch.tensor(
+            0.0, device=device, dtype=dtype))
+
+    complementary_slack = (inequality_constraints * dual_inequality)
+    max_complementary_slack = _safe_max_abs(complementary_slack)
+
+    dual_equality = dual_update(equality_constraints, dual_equality, penalty)
+    dual_inequality = inequality_projection(
+        dual_update(inequality_constraints, dual_inequality, penalty))
+
+    penalty = penalty * penalty_update_rate
+    iteration_ilqr += iteration
+    iteration_al += 1
+
+    if not (max_constraint_violation > constraints_threshold or
+            max_complementary_slack > constraints_threshold):
+      break
+
+  return (X, U, dual_equality, dual_inequality, penalty, equality_constraints,
+          inequality_constraints, max_constraint_violation, obj, gradient,
+          iteration_ilqr, iteration_al)
