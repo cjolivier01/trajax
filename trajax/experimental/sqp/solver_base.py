@@ -262,7 +262,7 @@ class TrajectoryOptimizationSolver(object):
             eq_resid, duals))
     return jnp.sum(costs) + resid_merit
 
-  @functools.partial(jax.jit, static_argnums=(0, 6))
+  @functools.partial(jax.jit, static_argnums=(0,))
   def _compute_adjoint(self, primals, duals, dynamics_params, cost_grads,
                        constraint_vals):
     """Compute grad_u(Lag) and adjoint of augmented Lagrangian.

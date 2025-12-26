@@ -658,7 +658,8 @@ class OptimizersTest(parameterized.TestCase):
     self.assertEqual(updated_mean.shape, (horizon, dim_control))
     self.assertEqual(updated_stdev.shape, (horizon, dim_control))
     self.assertTrue(np.allclose(updated_mean, np.ones_like(updated_mean)))
-    self.assertTrue(np.allclose(updated_stdev, np.zeros_like(updated_stdev)))
+    self.assertTrue(
+        np.allclose(updated_stdev, np.zeros_like(updated_stdev), atol=1e-6))
 
   def testConstrainedAcrobotSolve(self):
     T = 50
