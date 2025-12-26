@@ -8,6 +8,16 @@ import torch.func as tfunc
 from trajax.torch.tvlqr import rollout as tvlqr_rollout
 from trajax.torch.tvlqr import tvlqr
 
+def const_tensor(scalar: float | int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    t = torch.ones((), dtype=dtype, device=device)
+    return t * scalar
+
+def const_tensor_1d(scalar: float | int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    t = torch.ones((1), dtype=dtype, device=device)
+    return t * scalar
+
+
+
 pad = lambda A: torch.vstack(
     (A, torch.zeros((1,) + A.shape[1:], device=A.device, dtype=A.dtype)))
 
@@ -73,14 +83,22 @@ def rollout(dynamics, U, x0):
   return _rollout(dynamics, U, x0)
 
 
+# def _rollout(dynamics, U, x0, *args):
+#   device, dtype = x0.device, x0.dtype
+#   T, _ = U.shape
+#   X = torch.zeros((T + 1, x0.shape[0]), device=device, dtype=dtype)
+#   X[0] = x0
+#   for t in range(T):
+#     X[t + 1] = dynamics(X[t], U[t], t, *args)
+#   return X
+
+# vmap-friendly version
 def _rollout(dynamics, U, x0, *args):
-  device, dtype = x0.device, x0.dtype
-  T, _ = U.shape
-  X = torch.zeros((T + 1, x0.shape[0]), device=device, dtype=dtype)
-  X[0] = x0
-  for t in range(T):
-    X[t + 1] = dynamics(X[t], U[t], t, *args)
-  return X
+    T = U.shape[0]
+    xs = [x0]
+    for t in range(T):
+        xs.append(dynamics(xs[-1], U[t], t, *args))
+    return torch.stack(xs, dim=0)
 
 
 def evaluate(cost, X, U, *args):
@@ -99,7 +117,7 @@ def objective(cost, dynamics, U, x0):
 def adjoint(A, B, q, r):
   """Solve adjoint equations."""
   T = q.shape[0] - 1
-  device, dtype = q.device, q.dtype
+  # device, dtype = q.device, q.dtype
   P_store = []
   g_store = []
   p = q[T]

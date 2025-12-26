@@ -35,7 +35,8 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
   G = _symmetrize(R + torch.matmul(BtP, B))
 
   stacked = -torch.cat((H, h.reshape(h.shape[0], 1)), dim=1)
-  sol = torch.linalg.lstsq(G + delta * torch.eye(G.shape[-1], device=G.device, dtype=G.dtype), stacked).solution
+  sol = torch.linalg.lstsq(G + delta * torch.eye(G.shape[-1], device=G.device, dtype=G.dtype).to(torch.float32), stacked.to(torch.float32)).solution
+  sol = sol.to(G.dtype)
   K = sol[:, :-1]
   k = sol[:, -1]
 
