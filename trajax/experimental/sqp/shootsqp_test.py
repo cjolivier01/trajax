@@ -18,7 +18,7 @@ from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax.config import config  # pylint: disable=g-importing-member
+from jax import config
 import jax.numpy as jnp
 from trajax import integrators
 
@@ -106,6 +106,7 @@ def _setupAcrobot(options_overwrite):
       method=shootsqp.SQP_METHOD.STABLE,
       hess='gn',
       proj_init=True,
+      qp_solver=shootsqp.QP_SOLVER.QP_ALILQR,
       verbose=False,
       max_iter=100,
       ls_eta=0.49,
