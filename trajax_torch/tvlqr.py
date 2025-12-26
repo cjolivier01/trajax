@@ -34,23 +34,25 @@ import torch
 
 
 def rollout(K, k, x0, A, B, c):
-    """Rolls-out time-varying linear policy u[t] = K[t] x[t] + k[t]."""
+    """Rolls-out time-varying linear policy u[t] = K[t] x[t] + k[t].
 
+    vmap-compatible: avoids in-place operations.
+    """
     T, m, n = K.shape
-    device = K.device
-    dtype = K.dtype
 
-    X = torch.zeros((T + 1, n), device=device, dtype=dtype)
-    U = torch.zeros((T, m), device=device, dtype=dtype)
-    X[0] = x0
+    # Build trajectories as lists, then stack (vmap-compatible)
+    X_list = [x0]
+    U_list = []
+    x_current = x0
 
     for t in range(T):
-        u = torch.matmul(K[t], X[t]) + k[t]
-        x = torch.matmul(A[t], X[t]) + torch.matmul(B[t], u) + c[t]
-        X[t + 1] = x
-        U[t] = u
+        u = torch.matmul(K[t], x_current) + k[t]
+        x_next = torch.matmul(A[t], x_current) + torch.matmul(B[t], u) + c[t]
+        U_list.append(u)
+        X_list.append(x_next)
+        x_current = x_next
 
-    return X, U
+    return torch.stack(X_list), torch.stack(U_list)
 
 
 def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
@@ -110,6 +112,8 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
 def tvlqr(Q, q, R, r, M, A, B, c):
     """Discrete-time Finite Horizon Time-varying LQR.
 
+    vmap-compatible: avoids in-place operations.
+
     Note - for vectorization convenience, the leading dimension of R, r, M, A, B,
     C can be (T + 1) but the last row will be ignored.
 
@@ -131,27 +135,32 @@ def tvlqr(Q, q, R, r, M, A, B, c):
     """
 
     T = Q.shape[0] - 1
-    m = R.shape[1]
-    n = Q.shape[1]
-    device = Q.device
-    dtype = Q.dtype
 
-    P = torch.zeros((T+1, n, n), device=device, dtype=dtype)
-    p = torch.zeros((T+1, n), device=device, dtype=dtype)
-    K = torch.zeros((T, m, n), device=device, dtype=dtype)
-    k = torch.zeros((T, m), device=device, dtype=dtype)
+    # Build backward pass as lists, then stack (vmap-compatible)
+    P_list = [Q[T]]
+    p_list = [q[T]]
+    K_list = []
+    k_list = []
 
-    P[-1] = Q[T]
-    p[-1] = q[T]
+    P_next = Q[T]
+    p_next = q[T]
 
     for tt in range(T):
         t = T - 1 - tt
-        P_t, p_t, K_t, k_t = lqr_step(P[t+1], p[t+1], Q[t], q[t], R[t], r[t], M[t],
+        P_t, p_t, K_t, k_t = lqr_step(P_next, p_next, Q[t], q[t], R[t], r[t], M[t],
                                        A[t], B[t], c[t])
-        K[t] = K_t
-        k[t] = k_t
-        P[t] = P_t
-        p[t] = p_t
+        K_list.append(K_t)
+        k_list.append(k_t)
+        P_list.append(P_t)
+        p_list.append(p_t)
+        P_next = P_t
+        p_next = p_t
+
+    # Reverse lists (built backward, need forward order)
+    K = torch.stack(list(reversed(K_list)))
+    k = torch.stack(list(reversed(k_list)))
+    P = torch.stack(list(reversed(P_list)))
+    p = torch.stack(list(reversed(p_list)))
 
     return K, k, P, p
 

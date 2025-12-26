@@ -253,19 +253,22 @@ def rollout(dynamics, U, x0):
 
 
 def _rollout(dynamics, U, x0, *args):
-    """Internal rollout with additional arguments."""
-    T, m = U.shape
-    n = x0.shape[0]
-    device = U.device
-    dtype = U.dtype
+    """Internal rollout with additional arguments.
 
-    X = torch.zeros((T + 1, n), device=device, dtype=dtype)
-    X[0] = x0
+    vmap-compatible: avoids in-place operations.
+    """
+    T, m = U.shape
+
+    # Build trajectory as list, then stack (vmap-compatible)
+    X_list = [x0]
+    x_current = x0
 
     for t in range(T):
-        X[t + 1] = dynamics(X[t], U[t], t, *args)
+        x_next = dynamics(x_current, U[t], t, *args)
+        X_list.append(x_next)
+        x_current = x_next
 
-    return X
+    return torch.stack(X_list)
 
 
 def evaluate(cost, X, U, *args):
@@ -303,6 +306,8 @@ def objective(cost, dynamics, U, x0):
 def adjoint(A, B, q, r):
     """Solve adjoint equations.
 
+    vmap-compatible: avoids in-place operations.
+
     Args:
         A: dynamics Jacobians with respect to state.
         B: dynamics Jacobians with respect to control.
@@ -318,25 +323,25 @@ def adjoint(A, B, q, r):
       gradient, adjoints, _ = adjoint(A, B, q, r)
     """
 
-    n = q.shape[1]
     T = q.shape[0] - 1
-    m = r.shape[1]
-    device = A.device
-    dtype = A.dtype
 
-    P = torch.zeros((T, n), device=device, dtype=dtype)
-    g = torch.zeros((T, m), device=device, dtype=dtype)
+    # Build backward pass as lists (vmap-compatible)
+    P_list = []
+    g_list = []
 
     p = q[T]
 
     for tt in range(T):
         t = T - 1 - tt
-        g[t] = r[t] + torch.matmul(B[t].T, p)
+        g_t = r[t] + torch.matmul(B[t].T, p)
         p = torch.matmul(A[t].T, p) + q[t]
-        if t > 0:
-            P[t - 1] = p
 
-    P_full = torch.cat([P, q[T].unsqueeze(0)], dim=0)
+        g_list.append(g_t)
+        P_list.append(p)
+
+    # Reverse and stack
+    g = torch.stack(list(reversed(g_list)))
+    P_full = torch.stack(list(reversed(P_list)))
 
     return g, P_full, p
 
@@ -386,6 +391,8 @@ def project_psd_cone(Q, delta=0.0):
 def ddp_rollout(dynamics, X, U, K, k, alpha, *args):
     """Rollouts used in Differential Dynamic Programming.
 
+    vmap-compatible: avoids in-place operations.
+
     Args:
         dynamics: function with signature dynamics(x, u, t, *args).
         X: [T+1, n] current state trajectory.
@@ -402,23 +409,23 @@ def ddp_rollout(dynamics, X, U, K, k, alpha, *args):
           u = U[t] + del_u
           x = dynamics(Xnew[t], u, t)
     """
-    n = X.shape[1]
     T, m = U.shape
-    device = X.device
-    dtype = X.dtype
 
-    Xnew = torch.zeros((T + 1, n), device=device, dtype=dtype)
-    Unew = torch.zeros((T, m), device=device, dtype=dtype)
-    Xnew[0] = X[0]
+    # Build trajectories as lists (vmap-compatible)
+    Xnew_list = [X[0]]
+    Unew_list = []
+    x_current = X[0]
 
     for t in range(T):
-        del_u = alpha * k[t] + torch.matmul(K[t], Xnew[t] - X[t])
+        del_u = alpha * k[t] + torch.matmul(K[t], x_current - X[t])
         u = U[t] + del_u
-        x = dynamics(Xnew[t], u, t, *args)
-        Unew[t] = u
-        Xnew[t + 1] = x
+        x_next = dynamics(x_current, u, t, *args)
 
-    return Xnew, Unew
+        Unew_list.append(u)
+        Xnew_list.append(x_next)
+        x_current = x_next
+
+    return torch.stack(Xnew_list), torch.stack(Unew_list)
 
 
 def line_search_ddp(cost,
@@ -897,21 +904,28 @@ def constrained_ilqr(cost,
     num_equality = sample_eq.numel()
     num_inequality = sample_ineq.numel()
 
-    # Vectorized constraint functions
+    # Vectorized constraint functions (vmap-compatible)
     def evaluate_constraints(X, U):
         """Evaluate constraints along trajectory."""
         U_pad = pad(U)
-        eq_constraints = torch.zeros((horizon, num_equality), device=device, dtype=dtype)
-        ineq_constraints = torch.zeros((horizon, num_inequality), device=device, dtype=dtype)
+        eq_constraints_list = []
+        ineq_constraints_list = []
 
         for t in range(horizon):
             eq_t = equality_constraint(X[t], U_pad[t], t)
             ineq_t = inequality_constraint(X[t], U_pad[t], t)
 
-            if eq_t.numel() > 0:
-                eq_constraints[t] = eq_t
-            if ineq_t.numel() > 0:
-                ineq_constraints[t] = ineq_t
+            # Ensure consistent size (pad with zeros if empty)
+            if eq_t.numel() == 0:
+                eq_t = torch.zeros(num_equality, device=device, dtype=dtype)
+            if ineq_t.numel() == 0:
+                ineq_t = torch.zeros(num_inequality, device=device, dtype=dtype)
+
+            eq_constraints_list.append(eq_t)
+            ineq_constraints_list.append(ineq_t)
+
+        eq_constraints = torch.stack(eq_constraints_list) if num_equality > 0 else torch.zeros((horizon, 0), device=device, dtype=dtype)
+        ineq_constraints = torch.stack(ineq_constraints_list) if num_inequality > 0 else torch.zeros((horizon, 0), device=device, dtype=dtype)
 
         return eq_constraints, ineq_constraints
 
