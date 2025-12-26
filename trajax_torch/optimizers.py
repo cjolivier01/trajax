@@ -549,19 +549,11 @@ def ilqr(cost,
     lqr = get_lqr_params(X, U)
     _, q, _, r, _, A, B = lqr
     gradient, adjoints, _ = adjoint(A, B, q, r)
-    grad_norm_initial = torch.linalg.norm(gradient)
-    grad_norm_threshold = max(
-        grad_norm_threshold,
-        relative_grad_norm_threshold *
-        (1.0 if torch.isnan(grad_norm_initial) else float(grad_norm_initial + 1.0))
-    )
 
+    # CUDA-graphable: run for exactly maxiter iterations, no early stopping
     alpha = alpha_0
-    iteration = 0
-    obj_step = float('inf')
-    U_step = float('inf')
 
-    while iteration < maxiter:
+    for iteration in range(maxiter):
         Q, q, R, r, M, A, B = lqr
 
         K, k, _, _ = tvlqr(Q, q, R, r, M, A, B, c)
@@ -574,27 +566,10 @@ def ilqr(cost,
         _, q_new, _, r_new, _, A_new, B_new = lqr
         gradient, adjoints, _ = adjoint(A_new, B_new, q_new, r_new)
 
-        U_step = torch.linalg.norm(U_new - U).item()
-        obj_step = abs(float(obj_new - obj))
-
         # Update to new solution
         X, U, obj = X_new, U_new, obj_new
-        iteration = iteration + 1
 
-        # Check stopping criteria
-        grad_norm = torch.linalg.norm(gradient).item()
-        if torch.isnan(gradient).any():
-            grad_norm = float('inf')
-
-        still_improving_obj = obj_step > obj_step_threshold * (abs(float(obj)) + 1.0)
-        still_moving_U = U_step > inputs_step_threshold * (torch.linalg.norm(U).item() + 1.0)
-        still_progressing = still_improving_obj and still_moving_U
-        has_potential_to_improve = grad_norm > grad_norm_threshold and still_progressing
-
-        if not (has_potential_to_improve and alpha > alpha_min):
-            break
-
-    return X, U, obj, gradient, adjoints, lqr, iteration
+    return X, U, obj, gradient, adjoints, lqr, maxiter
 
 
 def scipy_minimize(cost,
@@ -987,12 +962,12 @@ def constrained_ilqr(cost,
         """Project inequality duals to positive orthant."""
         return torch.maximum(dual, torch.zeros_like(dual))
 
-    # Augmented Lagrangian loop
-    max_constraint_violation = torch.tensor(float('inf'), device=device, dtype=dtype)
-    obj = torch.tensor(float('inf'), device=device, dtype=dtype)
-    gradient = torch.full_like(U, float('inf'))
+    # Augmented Lagrangian loop - CUDA-graphable version (fixed iterations)
+    obj = torch.tensor(0.0, device=device, dtype=dtype)
+    gradient = torch.zeros_like(U)
 
-    while iteration_al < maxiter_al:
+    # Run for exactly maxiter_al iterations, no early stopping
+    for iteration_al in range(maxiter_al):
         # Create augmented cost with current dual variables and penalty
         def aug_cost(x, u, t):
             return augmented_lagrangian(x, u, t, dual_equality, dual_inequality, penalty)
@@ -1020,29 +995,6 @@ def constrained_ilqr(cost,
         # Evaluate constraints at new trajectory
         equality_constraints, inequality_constraints = evaluate_constraints(X, U)
 
-        # Compute constraint violations
-        inequality_constraints_projected = torch.maximum(
-            inequality_constraints,
-            torch.zeros_like(inequality_constraints)
-        )
-
-        max_eq_violation = torch.max(torch.abs(equality_constraints)) if num_equality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
-        max_ineq_violation = torch.max(inequality_constraints_projected) if num_inequality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
-        max_constraint_violation = torch.maximum(max_eq_violation, max_ineq_violation)
-
-        # Compute complementary slackness violation
-        if num_inequality > 0:
-            max_complementary_slack = torch.max(torch.abs(inequality_constraints * dual_inequality))
-        else:
-            max_complementary_slack = torch.tensor(0.0, device=device, dtype=dtype)
-
-        # Check convergence
-        constraint_satisfied = max_constraint_violation <= constraints_threshold
-        complementarity_satisfied = max_complementary_slack <= constraints_threshold
-
-        if constraint_satisfied and complementarity_satisfied:
-            break
-
         # Update dual variables
         dual_equality = dual_update(equality_constraints, dual_equality, penalty)
         dual_inequality = dual_update(inequality_constraints, dual_inequality, penalty)
@@ -1051,10 +1003,17 @@ def constrained_ilqr(cost,
         # Update penalty
         penalty = penalty * penalty_update_rate
 
-        # Increment AL iteration counter
-        iteration_al += 1
+    # Compute final constraint violations (for reporting)
+    inequality_constraints_projected = torch.maximum(
+        inequality_constraints,
+        torch.zeros_like(inequality_constraints)
+    )
+
+    max_eq_violation = torch.max(torch.abs(equality_constraints)) if num_equality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+    max_ineq_violation = torch.max(inequality_constraints_projected) if num_inequality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+    max_constraint_violation = torch.maximum(max_eq_violation, max_ineq_violation)
 
     return (X, U, dual_equality, dual_inequality, penalty,
             equality_constraints, inequality_constraints,
             max_constraint_violation, obj, gradient,
-            iteration_ilqr, iteration_al)
+            iteration_ilqr, maxiter_al)

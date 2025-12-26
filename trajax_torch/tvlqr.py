@@ -85,10 +85,17 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
 
     G = symmetrize(R + torch.matmul(BtP, B))
 
-    # Get damped (Levenberg-Marquardt) inverse using lstsq
-    K_k = torch.linalg.lstsq(
-        G, -torch.hstack((H, h.reshape(-1, 1))), rcond=delta
-    ).solution
+    # CUDA-graphable: use explicit inverse (torch.inverse is graph-compatible)
+    # Add sufficient damping for numerical stability
+    min_damping = max(delta, 1e-6)
+    G_damped = G + min_damping * torch.eye(G.shape[0], device=G.device, dtype=G.dtype)
+
+    # Solve: G_damped @ K_k = -[H, h] using explicit inverse
+    # torch.inverse is CUDA-graphable unlike solve/cholesky
+    G_inv = torch.inverse(G_damped)
+    rhs = -torch.hstack((H, h.reshape(-1, 1)))
+    K_k = torch.matmul(G_inv, rhs)
+
     K = K_k[:, :-1]
     k = K_k[:, -1]
 
