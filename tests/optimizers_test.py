@@ -28,7 +28,7 @@ from frozendict import frozendict
 import jax
 from jax import device_put
 from jax import vmap
-from jax.config import config
+# from jax.config import config
 import jax.flatten_util
 import jax.numpy as np
 import numpy as onp
@@ -37,7 +37,7 @@ from trajax import optimizers
 from trajax.integrators import euler
 from trajax.integrators import rk4
 
-config.update('jax_enable_x64', True)
+# config.update('jax_enable_x64', True)
 
 # TODO(sindhwani): np.nan semantics currently requires the following flag.
 os.environ['XLA_FLAGS'] = '--xla_cpu_enable_fast_math=false'
