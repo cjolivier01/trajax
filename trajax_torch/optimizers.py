@@ -829,3 +829,232 @@ def random_shooting(cost,
     X = rollout(dynamics, mean, init_state)
     obj = objective(cost, dynamics, mean, init_state)
     return X, U, obj
+
+
+# Constrained Trajectory Optimization
+
+
+def constrained_ilqr(cost,
+                     dynamics,
+                     x0,
+                     U,
+                     equality_constraint=None,
+                     inequality_constraint=None,
+                     maxiter_al=5,
+                     maxiter_ilqr=100,
+                     grad_norm_threshold=1.0e-4,
+                     relative_grad_norm_threshold=0.0,
+                     obj_step_threshold=0.0,
+                     inputs_step_threshold=0.0,
+                     constraints_threshold=1.0e-2,
+                     penalty_init=1.0,
+                     penalty_update_rate=10.0,
+                     make_psd=False,
+                     psd_delta=0.0,
+                     alpha_0=1.0,
+                     alpha_min=0.00005):
+    """Constrained Iterative Linear Quadratic Regulator (PyTorch GPU version).
+
+    Uses augmented Lagrangian method to handle equality and inequality constraints.
+    Everything stays on GPU - no CPU transfers or numpy usage.
+
+    Args:
+        cost: cost(x, u, t) returns scalar.
+        dynamics: dynamics(x, u, t) returns next state (n,) tensor.
+        x0: initial state - 1D tensor of shape (n,); should satisfy constraints at t==0.
+        U: initial controls - 2D tensor of shape (T, m); does not need to be initially feasible.
+        equality_constraint: equality_constraint(x, u, t) == 0 returns (num_equality,) tensor.
+                           If None, no equality constraints.
+        inequality_constraint: inequality_constraint(x, u, t) <= 0 returns (num_inequality,) tensor.
+                             If None, no inequality constraints.
+        maxiter_al: maximum number of outer-loop augmented Lagrangian iterations.
+        maxiter_ilqr: maximum iterations for iLQR.
+        grad_norm_threshold: tolerance for stopping iLQR before augmented Lagrangian update.
+        relative_grad_norm_threshold: relative tolerance on gradient norm.
+        obj_step_threshold: tolerance on objective value steps.
+        inputs_step_threshold: tolerance on input steps.
+        constraints_threshold: tolerance for constraint violation (infinity norm).
+        penalty_init: initial penalty value.
+        penalty_update_rate: rate for increasing penalty.
+        make_psd: whether to zero negative eigenvalues after quadratization.
+        psd_delta: delta value to make problem PSD.
+        alpha_0: initial line search value.
+        alpha_min: minimum line search value.
+
+    Returns:
+        X: optimal state trajectory - tensor of shape (T+1, n).
+        U: optimal control trajectory - tensor of shape (T, m).
+        dual_equality: approximate dual (equality) - tensor of shape (T+1, num_equality).
+        dual_inequality: approximate dual (inequality) - tensor of shape (T+1, num_inequality).
+        penalty: final penalty value.
+        equality_constraints: final equality constraint violations - tensor of shape (T+1, num_equality).
+        inequality_constraints: final inequality constraint violations - tensor of shape (T+1, num_inequality).
+        max_constraint_violation: maximum constraint violation (scalar tensor).
+        obj: final augmented Lagrangian objective.
+        gradient: gradient at solution.
+        iteration_ilqr: cumulative number of iLQR iterations.
+        iteration_al: number of augmented Lagrangian iterations.
+    """
+    device = U.device
+    dtype = U.dtype
+    T = U.shape[0]
+    n = x0.shape[0]
+    m = U.shape[1]
+
+    # Default constraint functions if not provided
+    if equality_constraint is None:
+        def equality_constraint(x, u, t):
+            return torch.empty(0, device=device, dtype=dtype)
+
+    if inequality_constraint is None:
+        def inequality_constraint(x, u, t):
+            return torch.empty(0, device=device, dtype=dtype)
+
+    # Rollout initial trajectory
+    X = rollout(dynamics, U, x0)
+
+    # Time range
+    horizon = T + 1
+
+    # Determine constraint dimensions by evaluating at t=0
+    sample_eq = equality_constraint(x0, torch.zeros(m, device=device, dtype=dtype), 0)
+    sample_ineq = inequality_constraint(x0, torch.zeros(m, device=device, dtype=dtype), 0)
+    num_equality = sample_eq.numel()
+    num_inequality = sample_ineq.numel()
+
+    # Vectorized constraint functions
+    def evaluate_constraints(X, U):
+        """Evaluate constraints along trajectory."""
+        U_pad = pad(U)
+        eq_constraints = torch.zeros((horizon, num_equality), device=device, dtype=dtype)
+        ineq_constraints = torch.zeros((horizon, num_inequality), device=device, dtype=dtype)
+
+        for t in range(horizon):
+            eq_t = equality_constraint(X[t], U_pad[t], t)
+            ineq_t = inequality_constraint(X[t], U_pad[t], t)
+
+            if eq_t.numel() > 0:
+                eq_constraints[t] = eq_t
+            if ineq_t.numel() > 0:
+                ineq_constraints[t] = ineq_t
+
+        return eq_constraints, ineq_constraints
+
+    # Initialize constraint evaluations
+    equality_constraints, inequality_constraints = evaluate_constraints(X, U)
+
+    # Get constraint dimensions
+    num_equality = equality_constraints.shape[1]
+    num_inequality = inequality_constraints.shape[1]
+
+    # Initialize dual variables
+    dual_equality = torch.zeros((horizon, num_equality), device=device, dtype=dtype)
+    dual_inequality = torch.zeros((horizon, num_inequality), device=device, dtype=dtype)
+
+    # Initialize penalty
+    penalty = torch.tensor(penalty_init, device=device, dtype=dtype)
+
+    # Counters
+    iteration_ilqr = 0
+    iteration_al = 0
+
+    # Augmented Lagrangian cost function
+    def augmented_lagrangian(x, u, t, dual_eq, dual_ineq, pen):
+        """Augmented Lagrangian cost = original cost + penalty terms."""
+        # Original cost
+        J = cost(x, u, t)
+
+        # Equality constraint contribution
+        eq = equality_constraint(x, u, t)
+        if eq.numel() > 0:
+            J = J + torch.dot(dual_eq[t], eq) + 0.5 * pen * torch.sum(eq ** 2)
+
+        # Inequality constraint contribution
+        ineq = inequality_constraint(x, u, t)
+        if ineq.numel() > 0:
+            # Active set: constraint is active if dual > 0 OR constraint is violated
+            active_set = ~((torch.abs(dual_ineq[t]) < 1e-10) & (ineq < 0.0))
+            J = J + torch.dot(dual_ineq[t], ineq) + 0.5 * pen * torch.sum((active_set * ineq) ** 2)
+
+        return J
+
+    # Dual update functions
+    def dual_update(constraint, dual, pen):
+        """Update dual variables."""
+        return dual + pen * constraint
+
+    def inequality_projection(dual):
+        """Project inequality duals to positive orthant."""
+        return torch.maximum(dual, torch.zeros_like(dual))
+
+    # Augmented Lagrangian loop
+    max_constraint_violation = torch.tensor(float('inf'), device=device, dtype=dtype)
+    obj = torch.tensor(float('inf'), device=device, dtype=dtype)
+    gradient = torch.full_like(U, float('inf'))
+
+    while iteration_al < maxiter_al:
+        # Create augmented cost with current dual variables and penalty
+        def aug_cost(x, u, t):
+            return augmented_lagrangian(x, u, t, dual_equality, dual_inequality, penalty)
+
+        # Solve iLQR with augmented cost
+        X, U, obj, gradient, _, _, ilqr_iter = ilqr(
+            aug_cost,
+            dynamics,
+            x0,
+            U,
+            maxiter=maxiter_ilqr,
+            grad_norm_threshold=grad_norm_threshold,
+            relative_grad_norm_threshold=relative_grad_norm_threshold,
+            obj_step_threshold=obj_step_threshold,
+            inputs_step_threshold=inputs_step_threshold,
+            make_psd=make_psd,
+            psd_delta=psd_delta,
+            alpha_0=alpha_0,
+            alpha_min=alpha_min
+        )
+
+        # Accumulate iLQR iterations
+        iteration_ilqr += ilqr_iter
+
+        # Evaluate constraints at new trajectory
+        equality_constraints, inequality_constraints = evaluate_constraints(X, U)
+
+        # Compute constraint violations
+        inequality_constraints_projected = torch.maximum(
+            inequality_constraints,
+            torch.zeros_like(inequality_constraints)
+        )
+
+        max_eq_violation = torch.max(torch.abs(equality_constraints)) if num_equality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+        max_ineq_violation = torch.max(inequality_constraints_projected) if num_inequality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+        max_constraint_violation = torch.maximum(max_eq_violation, max_ineq_violation)
+
+        # Compute complementary slackness violation
+        if num_inequality > 0:
+            max_complementary_slack = torch.max(torch.abs(inequality_constraints * dual_inequality))
+        else:
+            max_complementary_slack = torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Check convergence
+        constraint_satisfied = max_constraint_violation <= constraints_threshold
+        complementarity_satisfied = max_complementary_slack <= constraints_threshold
+
+        if constraint_satisfied and complementarity_satisfied:
+            break
+
+        # Update dual variables
+        dual_equality = dual_update(equality_constraints, dual_equality, penalty)
+        dual_inequality = dual_update(inequality_constraints, dual_inequality, penalty)
+        dual_inequality = inequality_projection(dual_inequality)
+
+        # Update penalty
+        penalty = penalty * penalty_update_rate
+
+        # Increment AL iteration counter
+        iteration_al += 1
+
+    return (X, U, dual_equality, dual_inequality, penalty,
+            equality_constraints, inequality_constraints,
+            max_constraint_violation, obj, gradient,
+            iteration_ilqr, iteration_al)
