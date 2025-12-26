@@ -46,6 +46,7 @@ The problem is to minimize over a sequence u[0], u[1]...u[T-1],
 from functools import partial
 import torch
 import scipy.optimize as osp_optimize
+from torch.func import jacrev, jacfwd, hessian
 from .tvlqr import rollout as tvlqr_rollout
 from .tvlqr import tvlqr
 
@@ -128,40 +129,25 @@ def linearize(fun, argnums=3):
     def jacobian_x_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
-        x_var = x.clone().detach().requires_grad_(True)
 
-        output = fun(x_var, u, t, *remaining_args)
+        # Use functorch jacrev (vmap-compatible)
+        # jacrev works for both scalar and vector outputs
+        jac_fn = jacrev(lambda x_: fun(x_, u, t, *remaining_args))
+        result = jac_fn(x)
 
-        if output.dim() == 0:  # Scalar output (gradient)
-            if x_var.grad is not None:
-                x_var.grad.zero_()
-            grad_tuple = torch.autograd.grad(output, x_var, create_graph=True, allow_unused=True)
-            grad = grad_tuple[0] if grad_tuple[0] is not None else torch.zeros_like(x_var)
-            return grad
-        else:  # Vector output (jacobian)
-            jac = torch.autograd.functional.jacobian(
-                lambda x_: fun(x_, u, t, *remaining_args), x_var
-            )
-            return jac
+        # For scalar output, jacrev returns gradient as-is
+        # For vector output, jacrev returns jacobian
+        return result
 
     def jacobian_u_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
-        u_var = u.clone().detach().requires_grad_(True)
 
-        output = fun(x, u_var, t, *remaining_args)
+        # Use functorch jacrev (vmap-compatible)
+        jac_fn = jacrev(lambda u_: fun(x, u_, t, *remaining_args))
+        result = jac_fn(u)
 
-        if output.dim() == 0:  # Scalar output (gradient)
-            if u_var.grad is not None:
-                u_var.grad.zero_()
-            grad_tuple = torch.autograd.grad(output, u_var, create_graph=True, allow_unused=True)
-            grad = grad_tuple[0] if grad_tuple[0] is not None else torch.zeros_like(u_var)
-            return grad
-        else:  # Vector output (jacobian)
-            jac = torch.autograd.functional.jacobian(
-                lambda u_: fun(x, u_, t, *remaining_args), u_var
-            )
-            return jac
+        return result
 
     def linearizer(*args):
         return jacobian_x_fn(*args), jacobian_u_fn(*args)
@@ -196,41 +182,28 @@ def quadratize(fun, argnums=3):
     def hessian_x_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
-        x_var = x.detach().requires_grad_(True)
 
-        hess = torch.autograd.functional.hessian(
-            lambda x_: fun(x_, u, t, *remaining_args), x_var
-        )
-        return hess
+        # Use functorch hessian (vmap-compatible)
+        hess_fn = hessian(lambda x_: fun(x_, u, t, *remaining_args))
+        return hess_fn(x)
 
     def hessian_u_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
-        u_var = u.detach().requires_grad_(True)
 
-        hess = torch.autograd.functional.hessian(
-            lambda u_: fun(x, u_, t, *remaining_args), u_var
-        )
-        return hess
+        # Use functorch hessian (vmap-compatible)
+        hess_fn = hessian(lambda u_: fun(x, u_, t, *remaining_args))
+        return hess_fn(u)
 
     def hessian_xu_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
-        x_var = x.detach().requires_grad_(True)
-        u_var = u.detach().requires_grad_(True)
 
-        # Compute mixed partial derivative
-        output = fun(x_var, u_var, t, *remaining_args)
-        grad_x = torch.autograd.grad(output, x_var, create_graph=True)[0]
-
-        # Jacobian of grad_x with respect to u
-        M = torch.autograd.functional.jacobian(
-            lambda u_: torch.autograd.grad(
-                fun(x_var, u_, t, *remaining_args), x_var, create_graph=True
-            )[0],
-            u_var
-        )
-        return M
+        # Compute mixed partial: d²f/dx du = J_u(grad_x f)
+        # Use jacfwd for the outer derivative (wrt u) and jacrev for inner (wrt x)
+        grad_x_fn = jacrev(lambda x_: fun(x_, u, t, *remaining_args))
+        M_fn = jacfwd(lambda u_: grad_x_fn(x))
+        return M_fn(u)
 
     def quadratizer(*args):
         return hessian_x_fn(*args), hessian_u_fn(*args), hessian_xu_fn(*args)
@@ -439,11 +412,15 @@ def line_search_ddp(cost,
                     dynamics_args=(),
                     alpha_0=1.0,
                     alpha_min=0.00005):
-    """Performs line search with respect to DDP rollouts."""
+    """Performs line search with respect to DDP rollouts.
 
-    # Handle NaN
-    if torch.isnan(obj):
-        obj = torch.tensor(float('inf'), device=obj.device, dtype=obj.dtype)
+    vmap-compatible: uses fixed iterations and torch.where for conditional updates.
+    """
+
+    # Handle NaN (vmap-compatible)
+    obj = torch.where(torch.isnan(obj),
+                     torch.tensor(float('inf'), device=obj.device, dtype=obj.dtype),
+                     obj)
 
     total_cost = lambda X, U: torch.sum(evaluate(cost, X, pad(U), *cost_args))
 
@@ -452,21 +429,23 @@ def line_search_ddp(cost,
     U_return = U
     obj_return = obj
 
-    while alpha > alpha_min:
+    # Fixed number of line search iterations (vmap-compatible)
+    max_line_search_iters = 10
+    for _ in range(max_line_search_iters):
         Xnew, Unew = ddp_rollout(dynamics, X, U, K, k, alpha, *dynamics_args)
         obj_new = total_cost(Xnew, Unew)
 
-        if torch.isnan(obj_new):
-            obj_new = obj
+        # Handle NaN (vmap-compatible)
+        obj_new = torch.where(torch.isnan(obj_new), obj, obj_new)
 
-        # Only return new trajs if leads to a strict cost decrease
-        if obj_new < obj:
-            X_return = Xnew
-            U_return = Unew
-            obj_return = obj_new
-            break
-        else:
-            alpha = 0.5 * alpha
+        # Only update if cost decreases (vmap-compatible)
+        improved = obj_new < obj
+        X_return = torch.where(improved.unsqueeze(-1).unsqueeze(-1), Xnew, X_return)
+        U_return = torch.where(improved.unsqueeze(-1).unsqueeze(-1), Unew, U_return)
+        obj_return = torch.where(improved, obj_new, obj_return)
+
+        # Update alpha for next iteration
+        alpha = 0.5 * alpha
 
     return X_return, U_return, obj_return, alpha
 
