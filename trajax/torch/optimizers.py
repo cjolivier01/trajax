@@ -167,18 +167,17 @@ def hamiltonian(cost, dynamics):
 
 def ddp_rollout(dynamics, X, U, K, k, alpha, *args):
   """Rollouts used in Differential Dynamic Programming."""
-  device, dtype = X.device, X.dtype
   T, m = U.shape
-  n = X.shape[1]
-  Xnew = torch.zeros((T + 1, n), device=device, dtype=dtype)
-  Unew = torch.zeros((T, m), device=device, dtype=dtype)
-  Xnew[0] = X[0]
+  xs = [X[0]]
+  us = []
   for t in range(T):
-    del_u = alpha * k[t] + torch.matmul(K[t], Xnew[t] - X[t])
+    del_u = alpha * k[t] + torch.matmul(K[t], xs[-1] - X[t])
     u = U[t] + del_u
-    x = dynamics(Xnew[t], u, t, *args)
-    Unew[t] = u
-    Xnew[t + 1] = x
+    x = dynamics(xs[-1], u, t, *args)
+    us.append(u)
+    xs.append(x)
+  Xnew = torch.stack(xs, dim=0)
+  Unew = torch.stack(us, dim=0)
   return Xnew, Unew
 
 
@@ -290,15 +289,19 @@ def gaussian_samples(generator, mean, stdev, control_low, control_high,
     generator = torch.Generator(device=device)
   num_samples = hyperparams['num_samples']
   horizon, dim_control = mean.shape
-  noises = torch.randn(
-      (num_samples, horizon, dim_control), generator=generator, device=device,
-      dtype=mean.dtype)
   smoothing_coef = hyperparams['sampling_smoothing']
-  for t in range(1, horizon):
-    noises[:, t] = (smoothing_coef * noises[:, t - 1] +
-                    torch.sqrt(torch.tensor(1 - smoothing_coef**2,
-                                             device=device, dtype=dtype)) *
-                    noises[:, t])
+  sqrt_term = torch.sqrt(torch.tensor(1 - smoothing_coef**2,
+                                      device=device, dtype=dtype))
+
+  noise_list = [torch.randn((num_samples, dim_control), generator=generator,
+                            device=device, dtype=mean.dtype)]
+  for _ in range(1, horizon):
+    eps = torch.randn((num_samples, dim_control), generator=generator,
+                      device=device, dtype=mean.dtype)
+    next_noise = smoothing_coef * noise_list[-1] + sqrt_term * eps
+    noise_list.append(next_noise)
+
+  noises = torch.stack(noise_list, dim=1)
   samples = noises * stdev + mean
   control_low = control_low.unsqueeze(0).expand_as(samples)
   control_high = control_high.unsqueeze(0).expand_as(samples)
@@ -435,21 +438,32 @@ def constrained_ilqr(cost,
 
   penalty = torch.tensor(penalty_init, device=device, dtype=dtype)
 
-  iteration_ilqr = 0
-  iteration_al = 0
-
   def _safe_max_abs(x):
     return torch.max(torch.abs(x)) if x.numel() else torch.tensor(
         0.0, device=device, dtype=dtype)
 
-  while iteration_al < maxiter_al:
+  iteration_ilqr_t = torch.tensor(0, device=device, dtype=torch.int64)
+  iteration_al_t = torch.tensor(0, device=device, dtype=torch.int64)
+  done = torch.tensor(False, device=device)
+
+  X_out, U_out = X, U
+  obj_out = torch.tensor(0.0, device=device, dtype=dtype)
+  gradient_out = torch.zeros_like(U)
+  dual_equality_out, dual_inequality_out = dual_equality, dual_inequality
+  penalty_out = penalty
+  equality_constraints_out = equality_constraints
+  inequality_constraints_out = inequality_constraints
+  max_constraint_violation_out = _safe_max_abs(equality_constraints)
+  max_complementary_slack_out = _safe_max_abs(inequality_constraints * dual_inequality)
+
+  for _ in range(maxiter_al):
     al_args = {
         'dual_equality': dual_equality,
         'dual_inequality': dual_inequality,
         'penalty': penalty,
     }
 
-    X, U, obj, gradient, _, _, iteration = ilqr(
+    X_new, U_new, obj_new, gradient_new, _, _, iteration = ilqr(
         partial(augmented_lagrangian, **al_args),
         dynamics,
         x0,
@@ -464,31 +478,74 @@ def constrained_ilqr(cost,
         alpha_0=alpha_0,
         alpha_min=alpha_min)
 
-    U_pad = pad(U)
-    equality_constraints = equality_constraint_mapped(X, U_pad, t_range)
-    inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
-    inequality_constraints_projected = inequality_projection(inequality_constraints)
+    U_pad = pad(U_new)
+    equality_constraints_new = equality_constraint_mapped(X_new, U_pad, t_range)
+    inequality_constraints_new = inequality_constraint_mapped(X_new, U_pad, t_range)
+    inequality_constraints_projected = inequality_projection(inequality_constraints_new)
 
     max_constraint_violation = torch.maximum(
-        _safe_max_abs(equality_constraints),
+        _safe_max_abs(equality_constraints_new),
         torch.max(inequality_constraints_projected) if inequality_constraints_projected.numel() else torch.tensor(
             0.0, device=device, dtype=dtype))
 
-    complementary_slack = (inequality_constraints * dual_inequality)
+    complementary_slack = (inequality_constraints_new * dual_inequality)
     max_complementary_slack = _safe_max_abs(complementary_slack)
 
-    dual_equality = dual_update(equality_constraints, dual_equality, penalty)
-    dual_inequality = inequality_projection(
-        dual_update(inequality_constraints, dual_inequality, penalty))
+    stop_now = torch.logical_and(
+        max_constraint_violation <= constraints_threshold,
+        max_complementary_slack <= constraints_threshold)
 
-    penalty = penalty * penalty_update_rate
-    iteration_ilqr += iteration
-    iteration_al += 1
+    keep_prev = done
+    active = ~keep_prev
 
-    if not (max_constraint_violation > constraints_threshold or
-            max_complementary_slack > constraints_threshold):
-      break
+    X_out = torch.where(keep_prev.view(1, 1), X_out, X_new)
+    U_out = torch.where(keep_prev.view(1, 1), U_out, U_new)
+    obj_out = torch.where(keep_prev, obj_out, obj_new)
+    gradient_out = torch.where(keep_prev.view(1, 1), gradient_out,
+                               gradient_new)
+    equality_constraints_out = torch.where(keep_prev.view(1, 1),
+                                           equality_constraints_out,
+                                           equality_constraints_new)
+    inequality_constraints_out = torch.where(keep_prev.view(1, 1),
+                                             inequality_constraints_out,
+                                             inequality_constraints_new)
+    max_constraint_violation_out = torch.where(keep_prev,
+                                               max_constraint_violation_out,
+                                               max_constraint_violation)
+    max_complementary_slack_out = torch.where(keep_prev,
+                                              max_complementary_slack_out,
+                                              max_complementary_slack)
 
-  return (X, U, dual_equality, dual_inequality, penalty, equality_constraints,
-          inequality_constraints, max_constraint_violation, obj, gradient,
-          iteration_ilqr, iteration_al)
+    dual_equality_new = dual_update(equality_constraints_new,
+                                    dual_equality, penalty)
+    dual_inequality_new = inequality_projection(
+        dual_update(inequality_constraints_new, dual_inequality, penalty))
+
+    dual_equality = torch.where(keep_prev.view(1, 1), dual_equality,
+                                dual_equality_new)
+    dual_inequality = torch.where(keep_prev.view(1, 1), dual_inequality,
+                                  dual_inequality_new)
+
+    dual_equality_out = torch.where(keep_prev.view(1, 1), dual_equality_out,
+                                    dual_equality)
+    dual_inequality_out = torch.where(keep_prev.view(1, 1),
+                                      dual_inequality_out, dual_inequality)
+
+    penalty_new = torch.where(keep_prev, penalty, penalty * penalty_update_rate)
+    penalty_out = torch.where(keep_prev, penalty_out, penalty_new)
+    penalty = penalty_new
+
+    iteration_tensor = torch.tensor(iteration, device=device, dtype=torch.int64)
+    iteration_ilqr_t = torch.where(keep_prev, iteration_ilqr_t,
+                                   iteration_ilqr_t + iteration_tensor)
+    iteration_al_t = torch.where(keep_prev, iteration_al_t,
+                                 iteration_al_t + 1)
+
+    done = torch.logical_or(done, stop_now)
+    U = torch.where(active.view(1, 1), U_new, U)
+    X = torch.where(active.view(1, 1), X_new, X)
+
+  return (X_out, U_out, dual_equality_out, dual_inequality_out, penalty_out,
+          equality_constraints_out, inequality_constraints_out,
+          max_constraint_violation_out, obj_out, gradient_out,
+          int(iteration_ilqr_t.item()), int(iteration_al_t.item()))

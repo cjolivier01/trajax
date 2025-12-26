@@ -56,21 +56,28 @@ def tvlqr(Q, q, R, r, M, A, B, c):
   n = Q.shape[1]
   device, dtype = Q.device, Q.dtype
 
-  P = torch.zeros((T + 1, n, n), device=device, dtype=dtype)
-  p = torch.zeros((T + 1, n), device=device, dtype=dtype)
-  K = torch.zeros((T, m, n), device=device, dtype=dtype)
-  k = torch.zeros((T, m), device=device, dtype=dtype)
+  # Build the sequences with Python lists to avoid in-place tensor writes while
+  # keeping identical numerical results.
+  P_list = [None] * (T + 1)
+  p_list = [None] * (T + 1)
+  K_list = [None] * T
+  k_list = [None] * T
 
-  P[-1] = Q[T]
-  p[-1] = q[T]
+  P_list[-1] = Q[T]
+  p_list[-1] = q[T]
 
   for tt in range(T - 1, -1, -1):
-    P_t, p_t, K_t, k_t = lqr_step(P[tt + 1], p[tt + 1], Q[tt], q[tt], R[tt],
-                                  r[tt], M[tt], A[tt], B[tt], c[tt])
-    P[tt] = P_t
-    p[tt] = p_t
-    K[tt] = K_t
-    k[tt] = k_t
+    P_t, p_t, K_t, k_t = lqr_step(P_list[tt + 1], p_list[tt + 1], Q[tt], q[tt],
+                                  R[tt], r[tt], M[tt], A[tt], B[tt], c[tt])
+    P_list[tt] = P_t
+    p_list[tt] = p_t
+    K_list[tt] = K_t
+    k_list[tt] = k_t
+
+  P = torch.stack(P_list, dim=0).to(device=device, dtype=dtype)
+  p = torch.stack(p_list, dim=0).to(device=device, dtype=dtype)
+  K = torch.stack(K_list, dim=0).to(device=device, dtype=dtype)
+  k = torch.stack(k_list, dim=0).to(device=device, dtype=dtype)
 
   return K, k, P, p
 
