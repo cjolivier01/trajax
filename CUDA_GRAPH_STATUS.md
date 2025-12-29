@@ -23,10 +23,16 @@ The fundamental issue is that **iLQR requires solving linear systems** at each i
 4. ❌ `torch.triangular_solve` - "operation not permitted when stream is capturing"
 5. ❌ `torch.inverse` - "operation not permitted when stream is capturing"
 
-**Root Cause:** These operations use cuSOLVER/cuBLAS kernels that:
-- Allocate temporary workspace memory dynamically
-- May use CPU synchronization for pivoting
-- Are fundamentally incompatible with CUDA graph capture
+**Root Cause:** PyTorch's wrappers around cuSolver allocate workspace memory during graph capture:
+
+```python
+# What PyTorch does internally (NOT graph-compatible):
+workspace_size = cusolverDn*_bufferSize(...)  # ❌ Called during capture
+workspace = cudaMalloc(workspace_size)         # ❌ Allocated during capture
+cusolverDn*getrf(workspace, ...)               # ✓ This could be graphable
+```
+
+The cuSolver operations **themselves** could be graph-compatible if PyTorch pre-allocated workspace before capture. The issue is PyTorch's wrapper calls `cudaMalloc()` dynamically during graph capture, which violates CUDA graph requirements (fixed memory layout).
 
 ## What We Achieved
 

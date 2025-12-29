@@ -46,7 +46,6 @@ The problem is to minimize over a sequence u[0], u[1]...u[T-1],
 from functools import partial
 import torch
 import scipy.optimize as osp_optimize
-from torch.func import jacrev, jacfwd, hessian
 from .tvlqr import rollout as tvlqr_rollout
 from .tvlqr import tvlqr
 
@@ -130,24 +129,21 @@ def linearize(fun, argnums=3):
         x, u, t = args[:3]
         remaining_args = args[3:]
 
-        # Use functorch jacrev (vmap-compatible)
-        # jacrev works for both scalar and vector outputs
-        jac_fn = jacrev(lambda x_: fun(x_, u, t, *remaining_args))
-        result = jac_fn(x)
-
-        # For scalar output, jacrev returns gradient as-is
-        # For vector output, jacrev returns jacobian
-        return result
+        # Use torch.autograd.functional (torch.compile compatible)
+        jac = torch.autograd.functional.jacobian(
+            lambda x_: fun(x_, u, t, *remaining_args), x
+        )
+        return jac
 
     def jacobian_u_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
 
-        # Use functorch jacrev (vmap-compatible)
-        jac_fn = jacrev(lambda u_: fun(x, u_, t, *remaining_args))
-        result = jac_fn(u)
-
-        return result
+        # Use torch.autograd.functional (torch.compile compatible)
+        jac = torch.autograd.functional.jacobian(
+            lambda u_: fun(x, u_, t, *remaining_args), u
+        )
+        return jac
 
     def linearizer(*args):
         return jacobian_x_fn(*args), jacobian_u_fn(*args)
@@ -183,27 +179,43 @@ def quadratize(fun, argnums=3):
         x, u, t = args[:3]
         remaining_args = args[3:]
 
-        # Use functorch hessian (vmap-compatible)
-        hess_fn = hessian(lambda x_: fun(x_, u, t, *remaining_args))
-        return hess_fn(x)
+        # Use torch.autograd.functional (torch.compile compatible)
+        hess = torch.autograd.functional.hessian(
+            lambda x_: fun(x_, u, t, *remaining_args), x
+        )
+        return hess
 
     def hessian_u_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
 
-        # Use functorch hessian (vmap-compatible)
-        hess_fn = hessian(lambda u_: fun(x, u_, t, *remaining_args))
-        return hess_fn(u)
+        # Use torch.autograd.functional (torch.compile compatible)
+        hess = torch.autograd.functional.hessian(
+            lambda u_: fun(x, u_, t, *remaining_args), u
+        )
+        return hess
 
     def hessian_xu_fn(*args):
         x, u, t = args[:3]
         remaining_args = args[3:]
 
-        # Compute mixed partial: d²f/dx du = J_u(grad_x f)
-        # Use jacfwd for the outer derivative (wrt u) and jacrev for inner (wrt x)
-        grad_x_fn = jacrev(lambda x_: fun(x_, u, t, *remaining_args))
-        M_fn = jacfwd(lambda u_: grad_x_fn(x))
-        return M_fn(u)
+        # Compute mixed partial: d²f/dx du
+        # Use jacobian of gradient wrt x
+        def cost_fn(x_, u_):
+            return fun(x_, u_, t, *remaining_args)
+
+        # Gradient wrt x
+        grad_x = torch.autograd.functional.jacobian(
+            lambda x_: cost_fn(x_, u), x
+        )
+
+        # Jacobian of grad_x wrt u gives mixed partial
+        M = torch.autograd.functional.jacobian(
+            lambda u_: torch.autograd.functional.jacobian(
+                lambda x_: cost_fn(x_, u_), x
+            ), u
+        )
+        return M
 
     def quadratizer(*args):
         return hessian_x_fn(*args), hessian_u_fn(*args), hessian_xu_fn(*args)
@@ -535,10 +547,20 @@ def ilqr(cost,
     lqr = get_lqr_params(X, U)
     _, q, _, r, _, A, B = lqr
     gradient, adjoints, _ = adjoint(A, B, q, r)
+    grad_norm_initial = torch.linalg.norm(gradient)
 
-    # CUDA-graphable: run for exactly maxiter iterations, no early stopping
+    # Compute effective gradient threshold
+    grad_norm_threshold = max(
+        grad_norm_threshold,
+        relative_grad_norm_threshold * (grad_norm_initial + 1.0)
+    )
+
     alpha = alpha_0
+    iteration = 0
+    obj_step = torch.tensor(float('inf'), device=device, dtype=dtype)
+    U_step = torch.tensor(float('inf'), device=device, dtype=dtype)
 
+    # torch.compile friendly: early stopping works!
     for iteration in range(maxiter):
         Q, q, R, r, M, A, B = lqr
 
@@ -552,10 +574,33 @@ def ilqr(cost,
         _, q_new, _, r_new, _, A_new, B_new = lqr
         gradient, adjoints, _ = adjoint(A_new, B_new, q_new, r_new)
 
+        # Compute step sizes (keep on GPU)
+        U_step = torch.linalg.norm(U_new - U)
+        obj_step = torch.abs(obj_new - obj)
+
         # Update to new solution
         X, U, obj = X_new, U_new, obj_new
 
-    return X, U, obj, gradient, adjoints, lqr, maxiter
+        # Check stopping criteria (torch.compile can handle this!)
+        grad_norm = torch.linalg.norm(gradient)
+
+        # Use torch.where to avoid breaking vmap, but break is ok for compile
+        has_nan = torch.isnan(gradient).any()
+        effective_grad_norm = torch.where(has_nan,
+                                          torch.tensor(float('inf'), device=device, dtype=dtype),
+                                          grad_norm)
+
+        # Convert tensor bools to Python bools for control flow
+        still_improving_obj = (obj_step > obj_step_threshold * (torch.abs(obj) + 1.0)).item()
+        still_moving_U = (U_step > inputs_step_threshold * (torch.linalg.norm(U) + 1.0)).item()
+        still_progressing = still_improving_obj and still_moving_U
+        has_potential = (effective_grad_norm > grad_norm_threshold).item() and still_progressing
+
+        # Early exit if converged (torch.compile handles this!)
+        if not (has_potential and alpha > alpha_min):
+            break
+
+    return X, U, obj, gradient, adjoints, lqr, iteration + 1
 
 
 def scipy_minimize(cost,
@@ -955,11 +1000,13 @@ def constrained_ilqr(cost,
         """Project inequality duals to positive orthant."""
         return torch.maximum(dual, torch.zeros_like(dual))
 
-    # Augmented Lagrangian loop - CUDA-graphable version (fixed iterations)
+    # Augmented Lagrangian loop - torch.compile friendly (early stopping works!)
     obj = torch.tensor(0.0, device=device, dtype=dtype)
     gradient = torch.zeros_like(U)
+    max_constraint_violation = torch.tensor(float('inf'), device=device, dtype=dtype)
+    max_complementary_slack = torch.tensor(float('inf'), device=device, dtype=dtype)
 
-    # Run for exactly maxiter_al iterations, no early stopping
+    iteration_al = 0
     for iteration_al in range(maxiter_al):
         # Create augmented cost with current dual variables and penalty
         def aug_cost(x, u, t):
@@ -988,6 +1035,31 @@ def constrained_ilqr(cost,
         # Evaluate constraints at new trajectory
         equality_constraints, inequality_constraints = evaluate_constraints(X, U)
 
+        # Compute constraint violations
+        inequality_constraints_projected = torch.maximum(
+            inequality_constraints,
+            torch.zeros_like(inequality_constraints)
+        )
+
+        max_eq_violation = torch.max(torch.abs(equality_constraints)) if num_equality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+        max_ineq_violation = torch.max(inequality_constraints_projected) if num_inequality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+        max_constraint_violation = torch.maximum(max_eq_violation, max_ineq_violation)
+
+        # Compute complementary slackness violation
+        if num_inequality > 0:
+            max_complementary_slack = torch.max(torch.abs(inequality_constraints * dual_inequality))
+        else:
+            max_complementary_slack = torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Check convergence (torch.compile handles this!)
+        # Convert tensor bools to Python bools for control flow
+        constraint_satisfied = (max_constraint_violation <= constraints_threshold).item()
+        complementarity_satisfied = (max_complementary_slack <= constraints_threshold).item()
+
+        # Early exit if converged
+        if constraint_satisfied and complementarity_satisfied:
+            break
+
         # Update dual variables
         dual_equality = dual_update(equality_constraints, dual_equality, penalty)
         dual_inequality = dual_update(inequality_constraints, dual_inequality, penalty)
@@ -996,17 +1068,7 @@ def constrained_ilqr(cost,
         # Update penalty
         penalty = penalty * penalty_update_rate
 
-    # Compute final constraint violations (for reporting)
-    inequality_constraints_projected = torch.maximum(
-        inequality_constraints,
-        torch.zeros_like(inequality_constraints)
-    )
-
-    max_eq_violation = torch.max(torch.abs(equality_constraints)) if num_equality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
-    max_ineq_violation = torch.max(inequality_constraints_projected) if num_inequality > 0 else torch.tensor(0.0, device=device, dtype=dtype)
-    max_constraint_violation = torch.maximum(max_eq_violation, max_ineq_violation)
-
     return (X, U, dual_equality, dual_inequality, penalty,
             equality_constraints, inequality_constraints,
             max_constraint_violation, obj, gradient,
-            iteration_ilqr, maxiter_al)
+            iteration_ilqr, iteration_al + 1)
