@@ -549,3 +549,273 @@ def constrained_ilqr(cost,
           equality_constraints_out, inequality_constraints_out,
           max_constraint_violation_out, obj_out, gradient_out,
           int(iteration_ilqr_t.item()), int(iteration_al_t.item()))
+
+
+def constrained_ilqr_pt_mpc(cost,
+                            dynamics,
+                            x0,
+                            U,
+                            equality_constraint=lambda x, u, t: torch.empty(
+                                0, device=x.device, dtype=x.dtype),
+                            inequality_constraint=lambda x, u, t: torch.empty(
+                                0, device=x.device, dtype=x.dtype),
+                            maxiter_al=5,
+                            maxiter_ilqr=100,
+                            grad_norm_threshold=1.0e-4,
+                            relative_grad_norm_threshold=0.0,
+                            obj_step_threshold=0.0,
+                            inputs_step_threshold=0.0,
+                            constraints_threshold=1.0e-2,
+                            penalty_init=1.0,
+                            penalty_update_rate=10.0,
+                            make_psd=True,
+                            psd_delta=0.0,
+                            alpha_0=1.0,
+                            alpha_min=0.00005,
+                            mpc_kwargs=None):
+  """Constrained iLQR using mpc.pytorch for the LQR subproblem."""
+  del relative_grad_norm_threshold, obj_step_threshold, inputs_step_threshold
+  del alpha_0, alpha_min
+
+  try:
+    from mpc import mpc as mpc_lib
+  except Exception as exc:
+    raise ImportError(
+        "mpc.pytorch is required for constrained_ilqr_pt_mpc") from exc
+
+  device, dtype = x0.device, x0.dtype
+  horizon = len(U) + 1
+  t_range = torch.arange(horizon, device=device)
+
+  def _safe_max_abs(x):
+    return torch.max(torch.abs(x)) if x.numel() else torch.tensor(
+        0.0, device=device, dtype=dtype)
+
+  def augmented_lagrangian(x, u, t, dual_equality, dual_inequality, penalty):
+    J = cost(x, u, t)
+    equality = equality_constraint(x, u, t)
+    inequality = inequality_constraint(x, u, t)
+
+    if equality.numel():
+      J = J + torch.dot(dual_equality[t], equality)
+      J = J + 0.5 * penalty * torch.dot(equality, equality)
+
+    if inequality.numel():
+      active_set = torch.logical_not(
+          torch.isclose(dual_inequality[t],
+                        torch.tensor(0.0, device=device, dtype=dtype))
+          & (inequality < 0.0)).to(dtype)
+      J = J + torch.dot(dual_inequality[t], inequality)
+      J = J + 0.5 * penalty * torch.dot(active_set * inequality, inequality)
+
+    return J
+
+  def dual_update(constraint, dual, penalty):
+    return dual + penalty * constraint
+
+  def inequality_projection(dual):
+    return torch.maximum(dual, torch.tensor(0.0, device=device, dtype=dtype))
+
+  def build_mpc_params(X_cur, U_cur, cost_fn):
+    quadratizer = quadratize(cost_fn)
+    cost_gradients = linearize(cost_fn)
+    dynamics_jacobians = linearize(dynamics)
+    psd = lambda mats: tfunc.vmap(lambda m: project_psd_cone(m, psd_delta))(mats)
+
+    Q, R, M = quadratizer(X_cur, U_cur, t_range)
+    if make_psd:
+      Q = psd(Q)
+      R = psd(R)
+    q, r = cost_gradients(X_cur, U_cur, t_range)
+    A, B = dynamics_jacobians(X_cur, U_cur, t_range)
+
+    if torch.max(torch.abs(R[-1])) == 0:
+      terminal_eps = max(psd_delta, 1e-6)
+      R = R.clone()
+      R[-1] = R[-1] + terminal_eps * torch.eye(
+          R.shape[-1], device=device, dtype=dtype)
+
+    n_state = X_cur.shape[1]
+    n_ctrl = U_cur.shape[1]
+    n_sc = n_state + n_ctrl
+
+    C = torch.zeros((horizon, n_sc, n_sc), device=device, dtype=dtype)
+    C[:, :n_state, :n_state] = Q
+    C[:, :n_state, n_state:] = M
+    C[:, n_state:, :n_state] = M.transpose(-1, -2)
+    C[:, n_state:, n_state:] = R
+
+    c = torch.cat((q, r), dim=-1)
+
+    F = torch.cat((A[:-1], B[:-1]), dim=-1)
+    return (C.unsqueeze(1), c.unsqueeze(1), F.unsqueeze(1))
+
+  mpc_kwargs = {} if mpc_kwargs is None else dict(mpc_kwargs)
+  base_u_lower = mpc_kwargs.pop('u_lower', None)
+  base_u_upper = mpc_kwargs.pop('u_upper', None)
+
+  def expand_bound(bound, U_pad):
+    if bound is None:
+      return None
+    if isinstance(bound, (float, int)):
+      bound = torch.full_like(U_pad, bound)
+    else:
+      bound = bound.to(device=device, dtype=dtype)
+      if bound.shape[0] == horizon - 1:
+        pad_row = torch.zeros((1,) + bound.shape[1:], device=device,
+                              dtype=dtype)
+        bound = torch.cat((bound, pad_row), dim=0)
+    return bound
+
+  equality_constraint_mapped = vectorize(equality_constraint)
+  inequality_constraint_mapped = vectorize(inequality_constraint)
+
+  U_cur = U
+  U_pad = pad(U_cur)
+  X_cur = rollout(dynamics, U_cur, x0)
+
+  equality_constraints = equality_constraint_mapped(X_cur, U_pad, t_range)
+  inequality_constraints = inequality_constraint_mapped(X_cur, U_pad, t_range)
+
+  dual_equality = torch.zeros_like(equality_constraints)
+  dual_inequality = torch.zeros_like(inequality_constraints)
+  penalty = torch.tensor(penalty_init, device=device, dtype=dtype)
+
+  iteration_ilqr_t = torch.tensor(0, device=device, dtype=torch.int64)
+  iteration_al_t = torch.tensor(0, device=device, dtype=torch.int64)
+  done = torch.tensor(False, device=device)
+
+  X_out, U_out = X_cur, U_cur
+  obj_out = torch.tensor(0.0, device=device, dtype=dtype)
+  gradient_out = torch.zeros_like(U_cur)
+  dual_equality_out, dual_inequality_out = dual_equality, dual_inequality
+  penalty_out = penalty
+  equality_constraints_out = equality_constraints
+  inequality_constraints_out = inequality_constraints
+  max_constraint_violation_out = _safe_max_abs(equality_constraints)
+  max_complementary_slack_out = _safe_max_abs(inequality_constraints * dual_inequality)
+
+  for _ in range(maxiter_al):
+    al_args = {
+        'dual_equality': dual_equality,
+        'dual_inequality': dual_inequality,
+        'penalty': penalty,
+    }
+    al_cost = partial(augmented_lagrangian, **al_args)
+
+    U_pad = pad(U_cur)
+    C, c, F = build_mpc_params(X_cur, U_pad, al_cost)
+
+    mpc_kwargs_iter = dict(mpc_kwargs)
+    mpc_kwargs_iter.setdefault('lqr_iter', maxiter_ilqr)
+    mpc_kwargs_iter.setdefault('eps', grad_norm_threshold)
+    mpc_kwargs_iter.setdefault('exit_unconverged', False)
+    mpc_kwargs_iter.setdefault('backprop', False)
+    mpc_kwargs_iter.setdefault('verbose', 0)
+    mpc_kwargs_iter.setdefault('n_batch', 1)
+    mpc_kwargs_iter['u_init'] = torch.zeros(
+        (horizon, 1, U_cur.shape[1]), device=device, dtype=dtype)
+
+    u_lower = expand_bound(base_u_lower, U_pad)
+    u_upper = expand_bound(base_u_upper, U_pad)
+    if u_lower is not None:
+      u_lower = (u_lower - U_pad).unsqueeze(1)
+    if u_upper is not None:
+      u_upper = (u_upper - U_pad).unsqueeze(1)
+
+    solver = mpc_lib.MPC(
+        x0.shape[0],
+        U_cur.shape[1],
+        horizon,
+        u_lower=u_lower,
+        u_upper=u_upper,
+        **mpc_kwargs_iter)
+
+    X_new, U_new, _ = solver(
+        torch.zeros((1, x0.shape[0]), device=device, dtype=dtype),
+        mpc_lib.QuadCost(C, c),
+        mpc_lib.LinDx(F, None))
+
+    U_delta_pad = U_new.squeeze(1)
+    U_new = U_cur + U_delta_pad[:-1]
+    U_pad = pad(U_new)
+    X_new = rollout(dynamics, U_new, x0)
+
+    equality_constraints_new = equality_constraint_mapped(
+        X_new, U_pad, t_range)
+    inequality_constraints_new = inequality_constraint_mapped(
+        X_new, U_pad, t_range)
+    inequality_constraints_projected = inequality_projection(
+        inequality_constraints_new)
+
+    max_constraint_violation = torch.maximum(
+        _safe_max_abs(equality_constraints_new),
+        torch.max(inequality_constraints_projected) if inequality_constraints_projected.numel() else torch.tensor(
+            0.0, device=device, dtype=dtype))
+
+    complementary_slack = (inequality_constraints_new * dual_inequality)
+    max_complementary_slack = _safe_max_abs(complementary_slack)
+
+    stop_now = torch.logical_and(
+        max_constraint_violation <= constraints_threshold,
+        max_complementary_slack <= constraints_threshold)
+
+    keep_prev = done
+    active = ~keep_prev
+
+    costs_new = evaluate(al_cost, X_new, U_pad)
+    obj_new = torch.sum(costs_new)
+    gradient_new = grad_wrt_controls(
+        al_cost, dynamics, U_new, x0)
+
+    X_out = torch.where(keep_prev.view(1, 1), X_out, X_new)
+    U_out = torch.where(keep_prev.view(1, 1), U_out, U_new)
+    obj_out = torch.where(keep_prev, obj_out, obj_new)
+    gradient_out = torch.where(keep_prev.view(1, 1), gradient_out,
+                               gradient_new)
+    equality_constraints_out = torch.where(keep_prev.view(1, 1),
+                                           equality_constraints_out,
+                                           equality_constraints_new)
+    inequality_constraints_out = torch.where(keep_prev.view(1, 1),
+                                             inequality_constraints_out,
+                                             inequality_constraints_new)
+    max_constraint_violation_out = torch.where(keep_prev,
+                                               max_constraint_violation_out,
+                                               max_constraint_violation)
+    max_complementary_slack_out = torch.where(keep_prev,
+                                              max_complementary_slack_out,
+                                              max_complementary_slack)
+
+    dual_equality_new = dual_update(equality_constraints_new,
+                                    dual_equality, penalty)
+    dual_inequality_new = inequality_projection(
+        dual_update(inequality_constraints_new, dual_inequality, penalty))
+
+    dual_equality = torch.where(keep_prev.view(1, 1), dual_equality,
+                                dual_equality_new)
+    dual_inequality = torch.where(keep_prev.view(1, 1), dual_inequality,
+                                  dual_inequality_new)
+
+    dual_equality_out = torch.where(keep_prev.view(1, 1), dual_equality_out,
+                                    dual_equality)
+    dual_inequality_out = torch.where(keep_prev.view(1, 1),
+                                      dual_inequality_out, dual_inequality)
+
+    penalty_new = torch.where(keep_prev, penalty, penalty * penalty_update_rate)
+    penalty_out = torch.where(keep_prev, penalty_out, penalty_new)
+    penalty = penalty_new
+
+    iteration_tensor = torch.tensor(maxiter_ilqr, device=device, dtype=torch.int64)
+    iteration_ilqr_t = torch.where(keep_prev, iteration_ilqr_t,
+                                   iteration_ilqr_t + iteration_tensor)
+    iteration_al_t = torch.where(keep_prev, iteration_al_t,
+                                 iteration_al_t + 1)
+
+    done = torch.logical_or(done, stop_now)
+    U_cur = torch.where(active.view(1, 1), U_new, U_cur)
+    X_cur = torch.where(active.view(1, 1), X_new, X_cur)
+
+  return (X_out, U_out, dual_equality_out, dual_inequality_out, penalty_out,
+          equality_constraints_out, inequality_constraints_out,
+          max_constraint_violation_out, obj_out, gradient_out,
+          int(iteration_ilqr_t.item()), int(iteration_al_t.item()))

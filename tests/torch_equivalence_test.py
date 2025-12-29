@@ -493,6 +493,74 @@ class TorchEquivalenceTest(parameterized.TestCase):
     self.assertEqual(X_torch.device.type, self.device.type)
     self.assertEqual(U_torch_opt.device.type, self.device.type)
 
+  def test_constrained_ilqr_mpc_parity(self):
+    try:
+      from mpc import mpc as mpc_lib  # noqa: F401
+    except Exception as exc:  # pragma: no cover - optional dependency
+      self.skipTest(f"mpc.pytorch not available: {exc}")
+
+    T, n, m = 3, 1, 1
+    A = 1.0
+    B = 1.0
+
+    def dynamics_torch(x, u, t):
+      del t
+      return torch.tensor(A, device=self.device) * x + torch.tensor(
+          B, device=self.device) * u
+
+    def cost_torch(x, u, t):
+      del t
+      return 0.5 * torch.sum(x**2) + 0.1 * torch.sum(u**2)
+
+    def equality_constraint_torch(x, u, t):
+      del x, u, t
+      return torch.empty(0, device=self.device, dtype=torch.float32)
+
+    def inequality_constraint_torch(x, u, t):
+      del x, u, t
+      return torch.empty(0, device=self.device, dtype=torch.float32)
+
+    x0_torch = torch.tensor([1.0], device=self.device, dtype=torch.float32)
+    U_torch = torch.zeros((T, m), device=self.device, dtype=torch.float32)
+
+    X_torch, U_torch_opt, _, _, _, _, _, _, obj_torch, _, _, _ = (
+        torch_optimizers.constrained_ilqr(
+            cost_torch,
+            dynamics_torch,
+            x0_torch,
+            U_torch,
+            equality_constraint=equality_constraint_torch,
+            inequality_constraint=inequality_constraint_torch,
+            maxiter_al=2,
+            maxiter_ilqr=10,
+            constraints_threshold=1e-4,
+            make_psd=True))
+
+    X_mpc, U_mpc, _, _, _, _, _, _, obj_mpc, _, _, _ = (
+        torch_optimizers.constrained_ilqr_pt_mpc(
+            cost_torch,
+            dynamics_torch,
+            x0_torch,
+            U_torch,
+            equality_constraint=equality_constraint_torch,
+            inequality_constraint=inequality_constraint_torch,
+            maxiter_al=2,
+            maxiter_ilqr=10,
+            constraints_threshold=1e-4,
+            make_psd=True))
+
+    onp.testing.assert_allclose(X_torch.detach().cpu().numpy(),
+                                X_mpc.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(U_torch_opt.detach().cpu().numpy(),
+                                U_mpc.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    onp.testing.assert_allclose(obj_torch.detach().cpu().numpy(),
+                                obj_mpc.detach().cpu().numpy(),
+                                rtol=1e-3, atol=1e-3)
+    self.assertEqual(X_mpc.device.type, self.device.type)
+    self.assertEqual(U_mpc.device.type, self.device.type)
+
 
 if __name__ == '__main__':
   absltest.main()
