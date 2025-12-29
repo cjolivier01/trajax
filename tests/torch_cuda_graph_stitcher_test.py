@@ -171,6 +171,26 @@ class CUDAGraphStitcherTest(absltest.TestCase):
     self.assertTrue(torch.allclose(lin1.weight, lin1_weight))
     self.assertFalse(torch.allclose(lin2.weight, lin2_weight))
 
+  def test_reuse_static_inputs(self):
+    if not torch.cuda.is_available():
+      self.skipTest("CUDA not available for CUDAGraphStitcher tests.")
+
+    device = torch.device("cuda")
+    stitcher = CUDAGraphStitcher(device=device, reuse_static_inputs=True)
+
+    def block(x):
+      return x + 1.0
+
+    x = torch.randn(4, device=device, dtype=torch.float32)
+    with stitcher.capture():
+      _ = stitcher.run(block, x)
+      _ = stitcher.run(block, x)
+
+    self.assertIs(
+        stitcher._segments[0].static_inputs[0],
+        stitcher._segments[1].static_inputs[0],
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -67,12 +67,14 @@ class CUDAGraphStitcher:
     Notes:
       - Each st.run(fn, *args) becomes a *segment* (captured graph).
       - Anything inside st.eager() runs eagerly and forces a segment boundary.
+      - Tensor leaves in args can be nested in lists/tuples/dicts.
       - All Tensor args to st.run must be CUDA tensors with static shapes/dtypes.
       - Eager blocks are replayed between segments and can feed the next segment.
       - replay() expects all external inputs in order of first appearance.
       - For training, capture the full step (forward+loss+backward+step) in a segment.
       - For training, prefer optimizer.zero_grad(set_to_none=False) to reuse grad buffers.
       - training_warmup controls extra warmup steps that also apply optimizer updates.
+      - reuse_static_inputs reuses input buffers across segments; only safe for read-only inputs.
     """
 
     def __init__(
@@ -81,11 +83,13 @@ class CUDAGraphStitcher:
         device: Optional[torch.device] = None,
         warmup: int = 3,
         training_warmup: int = 1,
+        reuse_static_inputs: bool = False,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         self.device = device
         self.warmup = warmup
         self.training_warmup = training_warmup
+        self.reuse_static_inputs = reuse_static_inputs
         self.stream = stream or torch.cuda.Stream(device=device)
 
         self._capturing: bool = False
@@ -100,6 +104,7 @@ class CUDAGraphStitcher:
         self._internal_tensor_ids: set[int] = set()
         self._replay_input_bindings: List[List[torch.Tensor]] = []
         self._replay_input_id_map: dict[int, int] = {}
+        self._external_static_input_cache: dict[int, torch.Tensor] = {}
 
     @contextlib.contextmanager
     def capture(self, *, training: bool = False):
@@ -137,6 +142,7 @@ class CUDAGraphStitcher:
                 raise TypeError("make_training_step wrapper only supports positional args.")
             if not captured:
                 self.clear()
+                self._seed_replay_inputs(self._flatten_tensors(args))
                 with self.capture(training=True):
                     out = step_fn(*args)
                 captured = True
@@ -196,6 +202,7 @@ class CUDAGraphStitcher:
         self._internal_tensor_ids.clear()
         self._replay_input_bindings.clear()
         self._replay_input_id_map.clear()
+        self._external_static_input_cache.clear()
         self._capture_device = None
 
     def run(self, fn: Callable[..., Any], *args: Any) -> Any:
@@ -208,7 +215,8 @@ class CUDAGraphStitcher:
         if self._force_eager:
             return self.run_eager(fn, *args)
 
-        targs = self._validate_tensor_args(args)
+        targs = tuple(self._flatten_tensors(args))
+        self._validate_tensors(targs)
         capture_device = self._resolve_capture_device(targs)
         self._ensure_cuda_device(capture_device)
 
@@ -217,20 +225,36 @@ class CUDAGraphStitcher:
 
         static_inputs: Tuple[torch.Tensor, ...]
         with torch.cuda.stream(self.stream):
-            static_inputs = tuple(
-                arg if id(arg) in self._static_tensor_ids else arg.clone()
-                for arg in targs
-            )
+            static_map: dict[int, torch.Tensor] = {}
+
+            def to_static(arg: torch.Tensor) -> torch.Tensor:
+                arg_id = id(arg)
+                if arg_id in static_map:
+                    return static_map[arg_id]
+                if arg_id in self._static_tensor_ids:
+                    static = arg
+                elif self.reuse_static_inputs:
+                    static = self._external_static_input_cache.get(arg_id)
+                    if static is None or static.shape != arg.shape or static.dtype != arg.dtype or static.device != arg.device:
+                        static = arg.clone()
+                        self._external_static_input_cache[arg_id] = static
+                else:
+                    static = arg.clone()
+                static_map[arg_id] = static
+                return static
+
+            static_args = self._map_tensors(args, to_static)
+            static_inputs = tuple(to_static(arg) for arg in targs)
             for tensor in static_inputs:
                 self._internal_tensor_ids.add(id(tensor))
             warmup_iters = self.training_warmup if self._training else self.warmup
             for _ in range(warmup_iters):
-                _ = fn(*static_inputs)
+                _ = fn(*static_args)
             self.stream.synchronize()
 
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, stream=self.stream):
-                out = fn(*static_inputs)
+                out = fn(*static_args)
 
         current_stream.wait_stream(self.stream)
 
@@ -288,7 +312,8 @@ class CUDAGraphStitcher:
         if not self._segments:
             raise RuntimeError("No captured segments to replay.")
 
-        replay_inputs = self._validate_tensor_args(replay_inputs)
+        replay_inputs = tuple(self._flatten_tensors(replay_inputs))
+        self._validate_tensors(replay_inputs, allow_empty=not self._replay_input_bindings)
         if self._capture_device is not None and any(
             inp.device != self._capture_device for inp in replay_inputs
         ):
@@ -470,7 +495,8 @@ class CUDAGraphStitcher:
                 slot = len(self._replay_input_bindings)
                 self._replay_input_id_map[arg_id] = slot
                 self._replay_input_bindings.append([])
-            self._replay_input_bindings[slot].append(static_input)
+            if all(id(existing) != id(static_input) for existing in self._replay_input_bindings[slot]):
+                self._replay_input_bindings[slot].append(static_input)
 
     def _register_external_inputs(
         self,
@@ -478,11 +504,11 @@ class CUDAGraphStitcher:
         kwargs: Dict[str, Any],
     ) -> None:
         for arg in args:
-            if isinstance(arg, torch.Tensor):
-                self._register_external_input(arg)
+            for tensor in self._flatten_tensors(arg):
+                self._register_external_input(tensor)
         for value in kwargs.values():
-            if isinstance(value, torch.Tensor):
-                self._register_external_input(value)
+            for tensor in self._flatten_tensors(value):
+                self._register_external_input(tensor)
 
     def _register_external_input(self, tensor: torch.Tensor) -> None:
         tensor_id = id(tensor)
@@ -494,17 +520,57 @@ class CUDAGraphStitcher:
         self._replay_input_id_map[tensor_id] = slot
         self._replay_input_bindings.append([])
 
-    def _validate_tensor_args(self, args: Sequence[Any]) -> Tuple[torch.Tensor, ...]:
-        targs: Tuple[torch.Tensor, ...] = tuple(args)  # type: ignore[assignment]
-        if not all(isinstance(a, torch.Tensor) for a in targs):
+    def _seed_replay_inputs(self, tensors: List[torch.Tensor]) -> None:
+        self._replay_input_bindings = [[] for _ in tensors]
+        self._replay_input_id_map = {id(tensor): idx for idx, tensor in enumerate(tensors)}
+
+    def _validate_tensors(
+        self,
+        tensors: Sequence[torch.Tensor],
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        if not tensors:
+            if allow_empty:
+                return
+            raise ValueError("CUDAGraphStitcher.run requires at least one Tensor input.")
+        if not all(isinstance(a, torch.Tensor) for a in tensors):
             raise TypeError(
-                "CUDAGraphStitcher.run: all args must be torch.Tensor for captured segments."
+                "CUDAGraphStitcher.run: all tensor inputs must be torch.Tensor."
             )
-        if not all(a.is_cuda for a in targs):
+        if not all(a.is_cuda for a in tensors):
             raise ValueError(
-                "CUDAGraphStitcher.run: all tensor args must be CUDA tensors."
+                "CUDAGraphStitcher.run: all tensor inputs must be CUDA tensors."
             )
-        return targs
+
+    def _flatten_tensors(self, obj: Any) -> List[torch.Tensor]:
+        tensors: List[torch.Tensor] = []
+
+        def visit(item: Any) -> None:
+            if isinstance(item, torch.Tensor):
+                tensors.append(item)
+                return
+            if isinstance(item, dict):
+                for key in item:
+                    visit(item[key])
+                return
+            if isinstance(item, (list, tuple)):
+                for value in item:
+                    visit(value)
+
+        visit(obj)
+        return tensors
+
+    def _map_tensors(self, obj: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return fn(obj)
+        if isinstance(obj, dict):
+            return {key: self._map_tensors(value, fn) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [self._map_tensors(value, fn) for value in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._map_tensors(value, fn) for value in obj)
+        return obj
 
     def _resolve_capture_device(self, targs: Tuple[torch.Tensor, ...]) -> torch.device:
         devices = {a.device for a in targs}
