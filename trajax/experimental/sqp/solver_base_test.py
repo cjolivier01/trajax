@@ -17,7 +17,7 @@
 from absl.testing import absltest
 import jax
 from jax import random
-from jax.config import config  # pylint: disable=g-importing-member
+from jax import config  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 from trajax import integrators
 from trajax import optimizers

@@ -42,6 +42,12 @@ setup(
     packages=find_packages(),
     package_data={},
     install_requires=install_requires,
+    extras_require={
+        # GPU-first PyTorch backend (installed separately in many environments).
+        'torch': ['torch>=2.1', 'triton'],
+        # Experimental SQP modules (used by tests under trajax/experimental/sqp).
+        'sqp': ['cvxpy>=1.4', 'ecos'],
+    },
     classifiers=[
         'Intended Audience :: Science/Research',
         'Topic :: Scientific/Engineering :: Artificial Intelligence',

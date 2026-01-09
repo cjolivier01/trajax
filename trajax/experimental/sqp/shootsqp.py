@@ -281,6 +281,15 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
       # Check for termination.
       if opt_true:
         status = Status.SOLVED
+        # If we terminate immediately, still record a single summary entry so
+        # that `history`/`times` are non-empty and consistent with
+        # `solution.iterations` expectations in tests.
+        if do_log and self.it == 0:
+          assert history is not None and times is not None
+          ddp_errs = (jnp.array(0.0), jnp.array(0.0))
+          self._record_summary(history, jnp.array(0.0), kkt_resid, ddp_errs)
+          times.append(0.0)
+          self.it = 1
         continue
 
       # Do SQP step.
@@ -315,6 +324,15 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
         status = Status.STALLED
       elif self.it >= max_iter:
         status = Status.MAXITER
+
+    # Ensure logging is non-empty even if we exit before the first iteration
+    # summary is recorded (e.g. due to immediate solver errors).
+    if do_log and self.it == 0:
+      assert history is not None and times is not None
+      ddp_errs = (jnp.array(0.0), jnp.array(0.0))
+      self._record_summary(history, jnp.array(0.0), kkt_resid, ddp_errs)
+      times.append(0.0)
+      self.it = 1
 
     obj = kkt_resid["obj"]
     if verbose:
@@ -641,7 +659,7 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
     history["steplength"].append(alpha)
     history["obj"].append(kkt_resid["obj"])
     history["min_viol"].append(kkt_resid["primal"][1])
-    if ddp_errs:
+    if ddp_errs and "ddp_err" in history:
       history["ddp_err"].append(ddp_errs[0])
       history["ddp_err_grad"].append(ddp_errs[1])
 

@@ -71,7 +71,7 @@ class TrajQP(abc.ABC):
 
   def reset_soln(self):
     """Resets default QP solution."""
-    self.soln = jax.tree_map(jnp.zeros_like, self.soln)
+    self.soln = jax.tree_util.tree_map(jnp.zeros_like, self.soln)
     return self.soln
 
   @abc.abstractmethod

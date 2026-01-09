@@ -18,7 +18,7 @@ from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax.config import config  # pylint: disable=g-importing-member
+from jax import config  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 from trajax import integrators
 

@@ -28,7 +28,7 @@ from frozendict import frozendict
 import jax
 from jax import device_put
 from jax import vmap
-from jax.config import config
+from jax import config
 import jax.flatten_util
 import jax.numpy as np
 import numpy as onp
@@ -543,8 +543,8 @@ class OptimizersTest(parameterized.TestCase):
             zip(vjp_methods, vjp_options_per_method)]
     def pytree_allclose(a, b, *args, **kwargs):
       return jax.flatten_util.ravel_pytree(
-          jax.tree_map(lambda x, y: np.allclose(x, y, *args, **kwargs), a,
-                       b))[0].all()
+          jax.tree_util.tree_map(lambda x, y: np.allclose(x, y, *args, **kwargs),
+                                 a, b))[0].all()
     for dX, dU in jacs[1:]:
       self.assertTrue(pytree_allclose(jacs[0][0], dX, atol=1e-6, rtol=1e-6))
       self.assertTrue(pytree_allclose(jacs[0][1], dU, atol=1e-6, rtol=1e-6))
@@ -628,7 +628,9 @@ class OptimizersTest(parameterized.TestCase):
     params_true = (A_true, B_true, Q_true, R_true, x0_true, X_true, U_true)
     arguments = (
         (A_true + A_perturb, 0) + params_true + (5000, 0.001),
-        (B_true + B_perturb, 1) + params_true + (5000, 0.001),
+        # For modern JAX versions, the loss gradient w.r.t. `B` can be larger
+        # than for `A`, so use a slightly smaller step size for stability.
+        (B_true + B_perturb, 1) + params_true + (5000, 0.0001),
         (Q_true + Q_perturb, 2) + params_true + (5000, 0.01),
         (R_true + R_perturb, 3) + params_true + (5000, 0.1),
         (x0_true + x0_perturb, 4) + params_true + (5000, 0.001),

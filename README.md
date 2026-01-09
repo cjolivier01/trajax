@@ -21,6 +21,21 @@ In Trajax, differentiation through the solution of a trajectory optimization pro
 
 Trajax is currently a work in progress, maintained by a few individuals at Google Research. While we are actively using Trajax in our own research projects, expect there to be bugs and rough edges compared to commercially available solvers.
 
+## PyTorch backend (GPU)
+
+This repo also includes a GPU-first PyTorch port of Trajax's core APIs under
+`trajax.torch` (no JAX/NumPy/SciPy in the PyTorch compute path).
+
+```python
+from trajax.torch import optimizers as torch_optimizers
+from trajax.torch import tvlqr as torch_tvlqr
+```
+
+Benchmarks comparing JAX vs PyTorch on GPU live in `benchmarks/compare_backends.py`.
+For CUDA graph capture, the Torch TVLQR path exposes in-place variants
+`trajax.torch.tvlqr.tvlqr_inplace` and `trajax.torch.tvlqr.rollout_inplace`
+that write into user-provided buffers.
+
 ## Installation
 
 To install directly from github using `pip`:
