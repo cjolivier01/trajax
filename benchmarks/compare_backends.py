@@ -72,9 +72,10 @@ def _time_torch(fn: Callable[..., Any],
 def _rand_spd(rng: onp.random.RandomState, shape, eps=1e-2, dtype=onp.float32):
   A = rng.randn(*shape).astype(dtype)
   if len(shape) == 2:
-    return (A + A.T) * 0.5 + eps * onp.eye(shape[0], dtype=dtype)
+    # True SPD (not just symmetric): A A^T + eps I.
+    return (A @ A.T) + eps * onp.eye(shape[0], dtype=dtype)
   if len(shape) == 3:
-    return (A + onp.swapaxes(A, -1, -2)) * 0.5 + eps * onp.eye(shape[-1], dtype=dtype)
+    return (A @ onp.swapaxes(A, -1, -2)) + eps * onp.eye(shape[-1], dtype=dtype)
   raise ValueError(shape)
 
 def _count_elems(arrs) -> int:
