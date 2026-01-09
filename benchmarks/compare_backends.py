@@ -121,9 +121,13 @@ def bench_tvlqr_solve(T: int, n: int, m: int, iters: int, warmup: int,
   ct = torch.as_tensor(c, device="cuda", dtype=t_dtype)
 
   j_fn = jax.jit(jax_tvlqr.tvlqr)
-  t_fn = torch_tvlqr.tvlqr
-  if torch_compile:
-    t_fn = torch.compile(t_fn, fullgraph=True)
+  def t_fn(Q, q, R, r, M, A, B, c):
+    # `torch.compile` currently struggles with `torch.linalg.lstsq` and with
+    # nested compile regions. The scan+solve path is itself captured via
+    # `torch.compile` internally by the higher-order ops.
+    if torch_compile:
+      return torch_tvlqr.tvlqr(Q, q, R, r, M, A, B, c, solver="solve", use_scan=True)
+    return torch_tvlqr.tvlqr(Q, q, R, r, M, A, B, c)
 
   j_s = _time_jax(j_fn, (Qj, qj, Rj, rj, Mj, Aj, Bj, cj), warmup, iters)
   t_s = _time_torch(t_fn, (Qt, qt, Rt, rt, Mt, At, Bt, ct), warmup, iters)
@@ -163,11 +167,10 @@ def bench_tvlqr_rollout(T: int, n: int, m: int, iters: int, warmup: int,
     return jax_tvlqr.rollout(K, k, x0, A, B, c)[1]
 
   def t_fn(K, k, x0, A, B, c):
-    return torch_tvlqr.rollout(K, k, x0, A, B, c)[1]
+    return torch_tvlqr.rollout(K, k, x0, A, B, c, use_scan=torch_compile)[1]
 
   j_fn = jax.jit(j_fn)
-  if torch_compile:
-    t_fn = torch.compile(t_fn, fullgraph=True)
+  # Same as tvlqr_solve: `use_scan=True` is captured internally.
 
   j_s = _time_jax(j_fn, (Kj, kj, x0j, Aj, Bj, cj), warmup, iters)
   t_s = _time_torch(t_fn, (Kt, kt, x0t, At, Bt, ct), warmup, iters)
@@ -361,8 +364,8 @@ def bench_ilqr_linear(T: int, n: int, m: int, maxiter: int, iters: int,
 
 
 def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
-                                  maxiter_ilqr: int, iters: int, warmup: int,
-                                  dtype: str):
+                                 maxiter_ilqr: int, iters: int, warmup: int,
+                                 dtype: str, torch_compile: bool):
   rng = onp.random.RandomState(0)
   np_dtype = onp.float32 if dtype == "float32" else onp.float64
   j_dtype = jnp.float32 if dtype == "float32" else jnp.float64
@@ -443,6 +446,21 @@ def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
     return torch.cat([u - umaxt, -u - umaxt], dim=0)
 
   def t_fn(x0):
+    if torch_compile:
+      # Use the specialized compile-friendly LQ solver (no torch.func).
+      return torch_optim.constrained_ilqr_linear_quadratic_box(
+          x0=x0,
+          U=U0t,
+          A=At,
+          B=Bt,
+          Q=Qt,
+          R=Rt,
+          x_goal=x_goal_t,
+          umax=umaxt,
+          maxiter_al=maxiter_al,
+          maxiter_ilqr=maxiter_ilqr,
+          final_weight=0.0,  # match `cost_t` in this benchmark (no goal in cost)
+      )[1]
     return torch_optim.constrained_ilqr(cost_t,
                                         dynamics_t,
                                         x0,
@@ -563,11 +581,10 @@ def main():
     res = bench_ilqr_linear(args.T, args.n, args.m, args.maxiter, args.iters,
                             args.warmup, args.dtype)
   elif args.cmd == "constrained_ilqr_linear":
-    if args.torch_compile:
-      print("note: --torch-compile is not supported for constrained_ilqr_linear")
     res = bench_constrained_ilqr_linear(args.T, args.n, args.m, args.maxiter_al,
                                         args.maxiter_ilqr, args.iters,
-                                        args.warmup, args.dtype)
+                                        args.warmup, args.dtype,
+                                        args.torch_compile)
   else:
     raise AssertionError(args.cmd)
 

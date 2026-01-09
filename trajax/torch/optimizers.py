@@ -19,6 +19,8 @@ import torch
 from .tvlqr import rollout as tvlqr_rollout
 from .tvlqr import tvlqr
 
+from torch import _higher_order_ops as _ho
+
 # Convenience routine to pad zeros for vectorization purposes.
 pad = lambda A: torch.cat(  # noqa: E731
     [A,
@@ -685,3 +687,174 @@ def constrained_ilqr(
   return (X, U, dual_equality, dual_inequality, penalty, equality_constraints,
           inequality_constraints, max_constraint_violation, obj, gradient,
           iteration_ilqr, iteration_al)
+
+
+def constrained_ilqr_linear_quadratic_box(
+    x0: torch.Tensor,
+    U: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Q: torch.Tensor,
+    R: torch.Tensor,
+    x_goal: torch.Tensor,
+    umax: torch.Tensor,
+    maxiter_al: int = 5,
+    maxiter_ilqr: int = 50,
+    constraints_threshold: float = 1.0e-2,
+    penalty_init: float = 1.0,
+    penalty_update_rate: float = 10.0,
+    final_weight: float = 10.0,
+    delta: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor]:
+  """Compile-friendly constrained iLQR for LQ problems with box constraints.
+
+  This specialized solver is intended for performance benchmarking and for
+  workloads where:
+    - dynamics: x[t+1] = A @ x[t] + B @ u[t]
+    - stage cost: 0.5 * (x^T Q x + u^T R u)
+    - terminal cost: 0.5 * x^T Q x + 0.5 * final_weight * (x-x_goal)^T Q (x-x_goal)
+    - equality constraint: x[T] == x_goal
+    - inequality constraint: |u[t]| <= umax (box), enforced via augmented Lagrangian
+
+  It avoids `torch.func` transforms and uses `torch._higher_order_ops` control
+  flow (scan/while_loop) for device-side looping without `.item()` syncs.
+  """
+  _require_cuda(x0, U, A, B, Q, R, x_goal, umax)
+  T = U.shape[0]
+  n = x0.shape[0]
+  m = U.shape[1]
+
+  # Avoid view aliasing: higher-order ops tracing forbids input aliasing.
+  A_seq = A.unsqueeze(0).repeat(T, 1, 1)
+  B_seq = B.unsqueeze(0).repeat(T, 1, 1)
+  Q_stage = Q.unsqueeze(0).repeat(T, 1, 1)
+  Qx_goal = Q @ x_goal
+  c_seq = torch.zeros((T, n), device=U.device, dtype=U.dtype)
+
+  def rollout_linear(U_in: torch.Tensor) -> torch.Tensor:
+    timesteps = torch.arange(T, device=U_in.device, dtype=torch.int64)
+
+    def step(x, xs_t):
+      u_t, t = xs_t
+      del t
+      x_next = A @ x + B @ u_t
+      y = x_next + 0  # avoid scan aliasing
+      return x_next, y
+
+    _, ys = _ho.scan(step, x0, (U_in, timesteps))
+    return torch.cat([x0.unsqueeze(0), ys], dim=0)
+
+  def constraints(X_in: torch.Tensor, U_in: torch.Tensor,
+                  dual_ineq: torch.Tensor):
+    U_pad = pad(U_in)
+    eq_T = X_in[-1] - x_goal
+    eq = torch.cat([torch.zeros((T, n), device=U.device, dtype=U.dtype),
+                    eq_T.unsqueeze(0)],
+                   dim=0)
+    ineq = torch.cat([U_pad - umax, -U_pad - umax], dim=1)
+    ineq_proj = torch.clamp(ineq, min=0.0)
+    max_violation = torch.maximum(eq.abs().amax(),
+                                  ineq_proj.amax() if ineq_proj.numel() else
+                                  torch.zeros((), device=U.device, dtype=U.dtype))
+    max_comp_slack = (ineq * dual_ineq).abs().amax() if ineq.numel() else torch.zeros(
+        (), device=U.device, dtype=U.dtype)
+    converged = (max_violation <= constraints_threshold) & (
+        max_comp_slack <= constraints_threshold)
+    return eq, ineq, max_violation, max_comp_slack, converged
+
+  X = rollout_linear(U)
+  dual_eq = torch.zeros((T + 1, n), device=U.device, dtype=U.dtype)
+  dual_ineq = torch.zeros((T + 1, 2 * m), device=U.device, dtype=U.dtype)
+  penalty = torch.tensor(float(penalty_init), device=U.device, dtype=U.dtype)
+  iteration_ilqr0 = torch.zeros((), device=U.device, dtype=torch.int64)
+
+  eq, ineq, max_violation, max_comp_slack, converged0 = constraints(X, U, dual_ineq)
+  obj = torch.tensor(float("nan"), device=U.device, dtype=U.dtype)
+  gradient = torch.zeros_like(U)
+  I_n = torch.eye(n, device=U.device, dtype=U.dtype)
+
+  def active_mask(U_in: torch.Tensor, dual_ineq_in: torch.Tensor):
+    U_pad = pad(U_in)
+    ineq_in = torch.cat([U_pad - umax, -U_pad - umax], dim=1)
+    active = ~((dual_ineq_in.abs() <= 0.0) & (ineq_in < 0.0))
+    return active.contiguous(), ineq_in
+
+  def solve_lq_given_duals(U_init: torch.Tensor, dual_eq_in: torch.Tensor,
+                           dual_ineq_in: torch.Tensor, penalty_in: torch.Tensor):
+    # Inner loop: update the active set until stable (or maxiter_ilqr).
+    active0, _ = active_mask(U_init, dual_ineq_in)
+
+    def cond_fn(it, _X, _U, _active_prev, active_changed):
+      return (it < maxiter_ilqr) & active_changed
+
+    def body_fn(it, X_in, U_in, active_prev, _active_changed):
+      active, ineq_in = active_mask(U_in, dual_ineq_in)
+      a = active[:T].to(U.dtype)
+      d = dual_ineq_in[:T]
+      a1, a2 = a[:, :m], a[:, m:]
+      d1, d2 = d[:, :m], d[:, m:]
+
+      diag_pen = a1 + a2  # (T, m)
+      R_seq = R.unsqueeze(0) + penalty_in * torch.diag_embed(diag_pen)
+      r_seq = (d1 - d2) - penalty_in * ((a1 - a2) * umax)
+
+      Q_seq = torch.cat([Q_stage,
+                         (Q + final_weight * Q + penalty_in * I_n).unsqueeze(0)],
+                        dim=0)
+      q_T = (-final_weight * Qx_goal +
+             dual_eq_in[-1] - penalty_in * x_goal)
+      q_seq = torch.cat([torch.zeros((T, n), device=U.device, dtype=U.dtype),
+                         q_T.unsqueeze(0)],
+                        dim=0)
+
+      M_seq = torch.zeros((T, n, m), device=U.device, dtype=U.dtype)
+      K, k, _, _ = tvlqr(Q_seq,
+                         q_seq,
+                         R_seq,
+                         r_seq,
+                         M_seq,
+                         A_seq,
+                         B_seq,
+                         c_seq,
+                         delta=delta,
+                         solver="solve",
+                         use_scan=True)
+      X_new, U_new = tvlqr_rollout(K, k, x0, A_seq, B_seq, c_seq, use_scan=True)
+      active_new, _ = active_mask(U_new, dual_ineq_in)
+      changed = (active_new != active).any()
+      return (it + 1, X_new, U_new, active, changed)
+
+    init_it = torch.zeros((), device=U.device, dtype=torch.int64)
+    init_changed = torch.tensor(True, device=U.device)
+    it, X_out, U_out, _active, _ = _ho.while_loop(cond_fn, body_fn,
+                                                  (init_it, rollout_linear(U_init), U_init, active0, init_changed))
+    return it, X_out, U_out
+
+  def cond_al(it_al, it_ilqr, _X, _U, _dual_eq, _dual_ineq, _penalty, converged):
+    del it_ilqr
+    return (it_al < maxiter_al) & (~converged)
+
+  def body_al(it_al, it_ilqr, X_in, U_in, dual_eq_in, dual_ineq_in, penalty_in, _converged):
+    it_i, X_sol, U_sol = solve_lq_given_duals(U_in, dual_eq_in, dual_ineq_in,
+                                              penalty_in)
+    it_ilqr = it_ilqr + it_i
+    eq_i, ineq_i, max_v_i, max_cs_i, conv_i = constraints(X_sol, U_sol, dual_ineq_in)
+    del X_in, max_v_i, max_cs_i
+    dual_eq_out = dual_eq_in + penalty_in * eq_i
+    dual_ineq_out = torch.clamp(dual_ineq_in + penalty_in * ineq_i, min=0.0)
+    penalty_out = penalty_in * float(penalty_update_rate)
+    return (it_al + 1, it_ilqr, X_sol, U_sol, dual_eq_out, dual_ineq_out,
+            penalty_out, conv_i)
+
+  init = (torch.zeros((), device=U.device, dtype=torch.int64), iteration_ilqr0,
+          X, U, dual_eq, dual_ineq, penalty, converged0)
+  it_al, it_ilqr, X, U, dual_eq, dual_ineq, penalty, converged = _ho.while_loop(
+      cond_al, body_al, init)
+  iteration_al = it_al
+  iteration_ilqr = it_ilqr
+
+  eq, ineq, max_violation, _max_comp_slack, _ = constraints(X, U, dual_ineq)
+  return (X, U, dual_eq, dual_ineq, penalty, eq, ineq, max_violation, obj,
+          gradient, iteration_ilqr, iteration_al)
