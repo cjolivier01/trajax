@@ -18,6 +18,7 @@ import torch
 
 from .tvlqr import rollout as tvlqr_rollout
 from .tvlqr import tvlqr
+from .tvlqr import tvlqr_inplace, rollout_inplace
 
 from torch import _higher_order_ops as _ho
 
@@ -858,3 +859,277 @@ def constrained_ilqr_linear_quadratic_box(
   eq, ineq, max_violation, _max_comp_slack, _ = constraints(X, U, dual_ineq)
   return (X, U, dual_eq, dual_ineq, penalty, eq, ineq, max_violation, obj,
           gradient, iteration_ilqr, iteration_al)
+
+
+class ConstrainedILQRLinearQuadraticBoxWorkspace:
+  """Preallocated buffers for CUDA-graphable constrained LQ iLQR."""
+
+  def __init__(self, T: int, n: int, m: int, device: torch.device,
+               dtype: torch.dtype):
+    self.T = int(T)
+    self.n = int(n)
+    self.m = int(m)
+    # Normalize to an explicit device index so equality checks behave as expected.
+    self.device = torch.device(device)
+    self.dtype = dtype
+
+    # Trajectory buffers.
+    self.X = torch.empty((T + 1, n), device=device, dtype=dtype)
+    self.U = torch.empty((T, m), device=device, dtype=dtype)
+    self.X_new = torch.empty((T + 1, n), device=device, dtype=dtype)
+    self.U_new = torch.empty((T, m), device=device, dtype=dtype)
+
+    # Padded controls and constraints.
+    self.U_pad = torch.empty((T + 1, m), device=device, dtype=dtype)
+    self.eq = torch.empty((T + 1, n), device=device, dtype=dtype)
+    self.ineq = torch.empty((T + 1, 2 * m), device=device, dtype=dtype)
+    self.ineq_pos = torch.empty((T + 1, 2 * m), device=device, dtype=dtype)
+    self.comp = torch.empty((T + 1, 2 * m), device=device, dtype=dtype)
+    self.active = torch.empty((T + 1, 2 * m), device=device, dtype=torch.bool)
+
+    # Duals and penalty.
+    self.dual_eq = torch.zeros((T + 1, n), device=device, dtype=dtype)
+    self.dual_ineq = torch.zeros((T + 1, 2 * m), device=device, dtype=dtype)
+    self.penalty = torch.tensor(1.0, device=device, dtype=dtype)
+
+    # LQR work buffers.
+    self.A_seq = torch.empty((T, n, n), device=device, dtype=dtype)
+    self.B_seq = torch.empty((T, n, m), device=device, dtype=dtype)
+    self.K = torch.empty((T, m, n), device=device, dtype=dtype)
+    self.k = torch.empty((T, m), device=device, dtype=dtype)
+    self.P = torch.empty((T + 1, n, n), device=device, dtype=dtype)
+    self.p = torch.empty((T + 1, n), device=device, dtype=dtype)
+
+    self.Q_seq = torch.empty((T + 1, n, n), device=device, dtype=dtype)
+    self.q_seq = torch.empty((T + 1, n), device=device, dtype=dtype)
+    self.R_seq = torch.empty((T, m, m), device=device, dtype=dtype)
+    self.r_seq = torch.empty((T, m), device=device, dtype=dtype)
+    self.M_seq = torch.zeros((T, n, m), device=device, dtype=dtype)
+    self.c_seq = torch.zeros((T, n), device=device, dtype=dtype)
+    self.I_n = torch.eye(n, device=device, dtype=dtype)
+    self.I_m = torch.eye(m, device=device, dtype=dtype)
+    self.one = torch.tensor(1.0, device=device, dtype=dtype)
+    self.penalty_rate = torch.tensor(10.0, device=device, dtype=dtype)
+
+    # Scratch.
+    self.diag_pen = torch.empty((T, m), device=device, dtype=dtype)
+    self.a1 = torch.empty((T, m), device=device, dtype=dtype)
+    self.a2 = torch.empty((T, m), device=device, dtype=dtype)
+    self.d1 = torch.empty((T, m), device=device, dtype=dtype)
+    self.d2 = torch.empty((T, m), device=device, dtype=dtype)
+
+    # Optional compiled callables for CUDA graph capture.
+    self._tvlqr_inplace_compiled = None
+
+  def compile_for_cuda_graph(self, delta: float = 1.0e-6):
+    """Pre-compiles the internal TVLQR kernel for CUDA graph capture.
+
+    Raw `torch.linalg.solve` is not stream-capture safe in some builds. The
+    Inductor-lowered version produced by `torch.compile` is capture-safe, so we
+    precompile once and then call the compiled kernel inside the graph.
+    """
+
+    def _kernel(Q, q, R, r, M, A, B, c, K_out, k_out, P_out, p_out, I_m):
+      return tvlqr_inplace(Q,
+                           q,
+                           R,
+                           r,
+                           M,
+                           A,
+                           B,
+                           c,
+                           K_out,
+                           k_out,
+                           P_out,
+                           p_out,
+                           delta=delta,
+                           I_m=I_m,
+                           solver="solve")
+
+    self._tvlqr_inplace_compiled = torch.compile(_kernel, fullgraph=True)
+
+
+def make_constrained_ilqr_linear_quadratic_box_workspace(
+    T: int,
+    n: int,
+    m: int,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+) -> ConstrainedILQRLinearQuadraticBoxWorkspace:
+  device = torch.device(device)
+  if device.type == "cuda" and device.index is None:
+    device = torch.device("cuda", torch.cuda.current_device())
+  return ConstrainedILQRLinearQuadraticBoxWorkspace(T, n, m, device, dtype)
+
+
+def constrained_ilqr_linear_quadratic_box_graphable(
+    x0: torch.Tensor,
+    U0: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Q: torch.Tensor,
+    R: torch.Tensor,
+    x_goal: torch.Tensor,
+    umax: torch.Tensor,
+    workspace: ConstrainedILQRLinearQuadraticBoxWorkspace,
+    maxiter_al: int = 2,
+    maxiter_ilqr: int = 5,
+    constraints_threshold: float = 1.0e-2,
+    penalty_init: float = 1.0,
+    penalty_update_rate: float = 10.0,
+    final_weight: float = 0.0,
+    delta: float = 1.0e-6,
+):
+  """CUDA-graphable constrained LQ solver (fixed loops, in-place buffers).
+
+  This is intended for `torch.cuda.CUDAGraph` capture:
+    - fixed shapes and fixed iteration counts
+    - no `.item()` / Python early-exit
+    - writes results into `workspace` buffers
+
+  The problem class matches `constrained_ilqr_linear` benchmark:
+    dynamics: x[t+1] = A @ x[t] + B @ u[t]
+    cost: 0.5 * (x^T Q x + u^T R u)
+    equality constraint: x[T] == x_goal
+    inequality constraint: |u[t]| <= umax
+  """
+  _require_cuda(x0, U0, A, B, Q, R, x_goal, umax)
+  if x0.device != workspace.device or x0.dtype != workspace.dtype:
+    raise ValueError("workspace device/dtype must match inputs.")
+  T = workspace.T
+  n = workspace.n
+  m = workspace.m
+  if U0.shape != (T, m) or x0.shape != (n,):
+    raise ValueError("Input shapes do not match workspace.")
+
+  # Initialize state.
+  workspace.U.copy_(U0)
+  workspace.X[0].copy_(x0)
+  workspace.A_seq.copy_(A.unsqueeze(0).expand(T, n, n))
+  workspace.B_seq.copy_(B.unsqueeze(0).expand(T, n, m))
+  for t in range(T):
+    workspace.X[t + 1].copy_(A @ workspace.X[t] + B @ workspace.U[t])
+
+  workspace.dual_eq.zero_()
+  workspace.dual_ineq.zero_()
+  workspace.penalty.fill_(float(penalty_init))
+  workspace.penalty_rate.fill_(float(penalty_update_rate))
+
+  # Pre-fill constant components of the LQR problem.
+  workspace.Q_seq[:T].copy_(Q.unsqueeze(0).expand(T, n, n))
+  workspace.q_seq.zero_()
+  workspace.R_seq.copy_(R.unsqueeze(0).expand(T, m, m))
+  workspace.r_seq.zero_()
+
+  Q_term_base = (1.0 + float(final_weight)) * Q
+  Qx_goal = Q @ x_goal
+
+  converged = torch.zeros((), device=workspace.device, dtype=torch.bool)
+
+  for _ in range(maxiter_al):
+    # Fixed inner loop (active-set stabilization).
+    for _ in range(maxiter_ilqr):
+      # U_pad = [U; 0]
+      workspace.U_pad[:T].copy_(workspace.U)
+      workspace.U_pad[T].zero_()
+
+      # ineq = [u-umax, -u-umax]
+      workspace.ineq[:, :m].copy_(workspace.U_pad).sub_(umax)
+      workspace.ineq[:, m:].copy_(workspace.U_pad).neg_().sub_(umax)
+
+      # active set for augmented term: active if dual!=0 or ineq>=0
+      workspace.active.copy_(
+          ~((workspace.dual_ineq.abs() <= 0.0) & (workspace.ineq < 0.0)))
+
+      # Build R_seq, r_seq for current dual/active set.
+      workspace.a1.copy_(workspace.active[:T, :m].to(workspace.dtype))
+      workspace.a2.copy_(workspace.active[:T, m:].to(workspace.dtype))
+      workspace.d1.copy_(workspace.dual_ineq[:T, :m])
+      workspace.d2.copy_(workspace.dual_ineq[:T, m:])
+
+      workspace.diag_pen.copy_(workspace.a1).add_(workspace.a2)  # (T, m)
+      workspace.R_seq.copy_(R.unsqueeze(0).expand(T, m, m))
+      workspace.R_seq.diagonal(dim1=-2, dim2=-1).add_(
+          workspace.penalty * workspace.diag_pen)
+
+      workspace.r_seq.copy_(workspace.d1).sub_(workspace.d2)
+      workspace.r_seq.add_(-workspace.penalty *
+                           ((workspace.a1 - workspace.a2) * umax))
+
+      # Terminal Q/q for equality constraint + penalty.
+      workspace.Q_seq[T].copy_(Q_term_base).add_(workspace.penalty * workspace.I_n)
+      workspace.q_seq[T].copy_(workspace.dual_eq[T]).sub_(
+          float(final_weight) * Qx_goal).add_(-workspace.penalty * x_goal)
+
+      # Solve TVLQR and roll out the optimal policy.
+      if workspace._tvlqr_inplace_compiled is None:
+        tvlqr_inplace(workspace.Q_seq,
+                      workspace.q_seq,
+                      workspace.R_seq,
+                      workspace.r_seq,
+                      workspace.M_seq,
+                      workspace.A_seq,
+                      workspace.B_seq,
+                      workspace.c_seq,
+                      workspace.K,
+                      workspace.k,
+                      workspace.P,
+                      workspace.p,
+                      delta=delta,
+                      I_m=workspace.I_m,
+                      solver="solve")
+      else:
+        workspace._tvlqr_inplace_compiled(workspace.Q_seq,
+                                          workspace.q_seq,
+                                          workspace.R_seq,
+                                          workspace.r_seq,
+                                          workspace.M_seq,
+                                          workspace.A_seq,
+                                          workspace.B_seq,
+                                          workspace.c_seq,
+                                          workspace.K,
+                                          workspace.k,
+                                          workspace.P,
+                                          workspace.p,
+                                          workspace.I_m)
+      rollout_inplace(workspace.K,
+                      workspace.k,
+                      x0,
+                      workspace.A_seq,
+                      workspace.B_seq,
+                      workspace.c_seq,
+                      workspace.X_new,
+                      workspace.U_new)
+
+      # Freeze updates after convergence (graph-friendly, no Python break).
+      upd = (~converged).to(workspace.dtype)
+      workspace.X.lerp_(workspace.X_new, upd)
+      workspace.U.lerp_(workspace.U_new, upd)
+
+    # Compute constraints and update duals/penalty (masked once converged).
+    workspace.eq.zero_()
+    workspace.eq[T].copy_(workspace.X[T]).sub_(x_goal)
+
+    workspace.U_pad[:T].copy_(workspace.U)
+    workspace.U_pad[T].zero_()
+    workspace.ineq[:, :m].copy_(workspace.U_pad).sub_(umax)
+    workspace.ineq[:, m:].copy_(workspace.U_pad).neg_().sub_(umax)
+
+    torch.clamp(workspace.ineq, min=0.0, out=workspace.ineq_pos)
+    max_violation = torch.maximum(workspace.eq.abs().amax(),
+                                  workspace.ineq_pos.amax())
+    workspace.comp.copy_(workspace.ineq).mul_(workspace.dual_ineq).abs_()
+    max_comp = workspace.comp.amax()
+    satisfied = (max_violation <= constraints_threshold) & (
+        max_comp <= constraints_threshold)
+    converged = converged | satisfied
+
+    upd = (~converged).to(workspace.dtype)
+    workspace.dual_eq.add_(upd * workspace.penalty * workspace.eq)
+    workspace.dual_ineq.add_(upd * workspace.penalty * workspace.ineq)
+    torch.clamp(workspace.dual_ineq, min=0.0, out=workspace.dual_ineq)
+    workspace.penalty.mul_(torch.where(upd > 0.0, workspace.penalty_rate,
+                                       workspace.one))
+
+  return (workspace.X, workspace.U, workspace.dual_eq, workspace.dual_ineq,
+          workspace.penalty, workspace.eq, workspace.ineq, max_violation)

@@ -365,8 +365,9 @@ def bench_ilqr_linear(T: int, n: int, m: int, maxiter: int, iters: int,
 
 
 def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
-                                 maxiter_ilqr: int, iters: int, warmup: int,
-                                 dtype: str, torch_compile: bool):
+                                  maxiter_ilqr: int, iters: int, warmup: int,
+                                 dtype: str, torch_compile: bool,
+                                 torch_cuda_graph: bool):
   rng = onp.random.RandomState(0)
   np_dtype = onp.float32 if dtype == "float32" else onp.float64
   j_dtype = jnp.float32 if dtype == "float32" else jnp.float64
@@ -447,6 +448,59 @@ def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
     return torch.cat([u - umaxt, -u - umaxt], dim=0)
 
   def t_fn(x0):
+    if torch_cuda_graph:
+      ws = torch_optim.make_constrained_ilqr_linear_quadratic_box_workspace(
+          T, n, m, device=x0.device, dtype=x0.dtype)
+      ws.compile_for_cuda_graph(delta=1e-6)
+      # Warmup outside capture (also warms up the compiled TVLQR kernel).
+      for _ in range(max(1, warmup)):
+        torch_optim.constrained_ilqr_linear_quadratic_box_graphable(
+            x0=x0,
+            U0=U0t,
+            A=At,
+            B=Bt,
+            Q=Qt,
+            R=Rt,
+            x_goal=x_goal_t,
+            umax=umaxt,
+            workspace=ws,
+            maxiter_al=maxiter_al,
+            maxiter_ilqr=maxiter_ilqr,
+            final_weight=0.0,
+            delta=1e-6,
+        )
+      torch.cuda.synchronize()
+
+      g = torch.cuda.CUDAGraph()
+      with torch.cuda.graph(g):
+        torch_optim.constrained_ilqr_linear_quadratic_box_graphable(
+            x0=x0,
+            U0=U0t,
+            A=At,
+            B=Bt,
+            Q=Qt,
+            R=Rt,
+            x_goal=x_goal_t,
+            umax=umaxt,
+            workspace=ws,
+            maxiter_al=maxiter_al,
+            maxiter_ilqr=maxiter_ilqr,
+            final_weight=0.0,
+            delta=1e-6,
+        )
+
+      # Time replay only.
+      torch.cuda.synchronize()
+      start_evt = torch.cuda.Event(enable_timing=True)
+      end_evt = torch.cuda.Event(enable_timing=True)
+      start_evt.record()
+      for _ in range(iters):
+        g.replay()
+      end_evt.record()
+      torch.cuda.synchronize()
+      ms = start_evt.elapsed_time(end_evt)
+      return torch.tensor((ms / 1e3) / iters, device="cuda", dtype=torch.float64)
+
     if torch_compile:
       # Use the specialized compile-friendly LQ solver (no torch.func).
       return torch_optim.constrained_ilqr_linear_quadratic_box(
@@ -472,7 +526,11 @@ def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
                                         maxiter_ilqr=maxiter_ilqr)[1]
 
   j_s = _time_jax(j_fn, (x0j,), warmup, iters)
-  t_s = _time_torch(t_fn, (x0t,), warmup, iters)
+  if torch_cuda_graph:
+    # `t_fn` returns a scalar time estimate already.
+    t_s = float(t_fn(x0t).detach().cpu().numpy())
+  else:
+    t_s = _time_torch(t_fn, (x0t,), warmup, iters)
   return {"jax_s": j_s, "torch_s": t_s, "elements": elems}
 
 
@@ -490,6 +548,7 @@ def main():
     sp.add_argument("--warmup", type=int, default=10)
     sp.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     sp.add_argument("--torch-compile", action="store_true")
+    sp.add_argument("--torch-cuda-graph", action="store_true")
     sp.add_argument(
         "--preset",
         choices=("custom", "big"),
@@ -532,6 +591,10 @@ def main():
   args = p.parse_args()
   if args.dtype == "float32":
     torch.set_float32_matmul_precision("high")
+
+  if args.torch_cuda_graph and args.torch_compile:
+    print("note: --torch-cuda-graph implies a specialized compiled path; ignoring --torch-compile")
+    args.torch_compile = False
 
   # Apply large presets (picked to keep memory reasonable while increasing
   # element count significantly for the simple TVLQR benchmarks).
@@ -585,7 +648,8 @@ def main():
     res = bench_constrained_ilqr_linear(args.T, args.n, args.m, args.maxiter_al,
                                         args.maxiter_ilqr, args.iters,
                                         args.warmup, args.dtype,
-                                        args.torch_compile)
+                                        args.torch_compile,
+                                        args.torch_cuda_graph)
   else:
     raise AssertionError(args.cmd)
 

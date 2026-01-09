@@ -36,6 +36,11 @@ For CUDA graph capture, the Torch TVLQR path exposes in-place variants
 `trajax.torch.tvlqr.tvlqr_inplace` and `trajax.torch.tvlqr.rollout_inplace`
 that write into user-provided buffers.
 
+For constrained LQ problems with box constraints, the Torch backend also
+includes a CUDA-graphable fixed-iteration variant:
+`trajax.torch.optimizers.constrained_ilqr_linear_quadratic_box_graphable`
+(use `workspace.compile_for_cuda_graph()` before capture).
+
 ## Installation
 
 To install directly from github using `pip`:
