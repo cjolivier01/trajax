@@ -322,11 +322,16 @@ def ilqr(
     cost_args: Sequence[Any] = (),
     dynamics_args: Sequence[Any] = (),
     static_loop: bool = False,
+    vmap_safe: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-           Tuple[torch.Tensor, ...], int]:
+           Tuple[torch.Tensor, ...], torch.Tensor]:
   """Iterative LQR (iLQR) in PyTorch.
 
   Returns (X, U, obj, gradient, adjoints, lqr, iteration).
+
+  Note: the iteration count is returned as a scalar tensor to keep the control
+  flow compatible with torch.vmap / torch.compile. The loop always runs a fixed
+  maxiter with masked updates (static_loop/vmap_safe retained for compatibility).
   """
   _require_cuda(x0, U)
   T = U.shape[0]
@@ -359,25 +364,29 @@ def ilqr(
   _, q, _, r, _, A, B = lqr
   gradient, adjoints, _ = adjoint(A, B, q, torch.cat([r, torch.zeros_like(r[:1])], dim=0))
   grad_norm_initial = torch.linalg.vector_norm(gradient)
-  if float(grad_norm_initial.item()) <= float(grad_norm_threshold):
-    # Match JAX behavior: if the initial gradient is already small enough,
-    # return without performing an LQR solve/line-search step.
-    return X, U, obj, gradient, adjoints, lqr, 0
   grad_norm_initial_safe = torch.where(torch.isnan(grad_norm_initial),
                                        torch.tensor(0.0,
                                                     device=U.device,
                                                     dtype=U.dtype),
                                        grad_norm_initial)
-  grad_norm_threshold_val = max(
-      float(grad_norm_threshold),
-      float(relative_grad_norm_threshold) * (float(grad_norm_initial_safe.item()) + 1.0),
+  grad_norm_threshold_t = torch.as_tensor(grad_norm_threshold,
+                                          device=U.device,
+                                          dtype=U.dtype)
+  rel_grad_norm_threshold_t = torch.as_tensor(relative_grad_norm_threshold,
+                                              device=U.device,
+                                              dtype=U.dtype)
+  grad_norm_threshold_t = torch.maximum(
+      grad_norm_threshold_t,
+      rel_grad_norm_threshold_t * (grad_norm_initial_safe + 1.0),
   )
-  grad_norm_threshold_t = torch.tensor(grad_norm_threshold_val,
-                                       device=U.device,
-                                       dtype=U.dtype)
 
-  for i in range(maxiter):
-    iteration = i
+  # Use a tensor flag for early-exit semantics without Python control flow.
+  active = ~(grad_norm_initial <= grad_norm_threshold_t)
+  iteration_count = torch.zeros((), device=U.device, dtype=torch.int64)
+
+  for _ in range(maxiter):
+    active_prev = active
+    iteration_count = torch.where(active_prev, iteration_count + 1, iteration_count)
     Q, q, R, r, M, A, B = lqr
     # Solve LQR subproblem.
     K, kk, _, _ = tvlqr(Q, q, R, r, M, A, B, c)
@@ -412,18 +421,14 @@ def ilqr(
     still_progressing = still_improving_obj & still_moving_U
     has_potential = (grad_norm > grad_norm_threshold_t) & still_progressing & (alpha > alpha_min)
 
-    if not static_loop:
-      if not bool(has_potential.item()):
-        break
-
-    update = has_potential if static_loop else torch.tensor(True,
-                                                           device=U.device)
+    update = active_prev & has_potential
     X = torch.where(update, X_new, X)
     U = torch.where(update, U_new, U)
     obj = torch.where(update, obj_new, obj)
     lqr = tuple(torch.where(update, new, old) for new, old in zip(lqr_new, lqr))
+    active = update
 
-  return X, U, obj, gradient, adjoints, lqr, iteration + 1
+  return X, U, obj, gradient, adjoints, lqr, iteration_count
 
 
 def default_cem_hyperparams() -> Dict[str, float]:
@@ -572,11 +577,15 @@ def constrained_ilqr(
     alpha_min: float = 0.00005,
     cost_args: Sequence[Any] = (),
     dynamics_args: Sequence[Any] = (),
+    vmap_safe: bool = False,
 ):
   """Constrained iLQR via an augmented Lagrangian outer loop (GPU-first).
 
   Mirrors `trajax.optimizers.constrained_ilqr`, but uses PyTorch tensors and
   runs entirely on the GPU.
+
+  Note: iteration counts are returned as scalar tensors to keep the control
+  flow compatible with torch.vmap / torch.compile.
   """
   _require_cuda(x0, U)
   if equality_constraint is None:
@@ -618,8 +627,8 @@ def constrained_ilqr(
     return J
 
   # Outer augmented Lagrangian loop.
-  iteration_ilqr = 0
-  iteration_al = 0
+  iteration_ilqr = torch.zeros((), device=U.device, dtype=torch.int64)
+  iteration_al = torch.zeros((), device=U.device, dtype=torch.int64)
   ineq_proj0 = inequality_projection(inequality_constraints)
   max_constraint_violation = torch.maximum(
       equality_constraints.abs().amax() if equality_constraints.numel() else torch.zeros(
@@ -632,18 +641,19 @@ def constrained_ilqr(
 
   max_comp_slack0 = (inequality_constraints * dual_inequality).abs().amax(
   ) if inequality_constraints.numel() else torch.zeros((), device=U.device, dtype=U.dtype)
-  if (float(max_constraint_violation.item()) <= constraints_threshold and
-      float(max_comp_slack0.item()) <= constraints_threshold):
-    return (X, U, dual_equality, dual_inequality, penalty, equality_constraints,
-            inequality_constraints, max_constraint_violation, obj, gradient,
-            iteration_ilqr, iteration_al)
+  converged0 = (max_constraint_violation <= constraints_threshold) & (
+      max_comp_slack0 <= constraints_threshold)
+  active = ~converged0
 
   for _ in range(maxiter_al):
+    active_prev = active
+    iteration_al = torch.where(active_prev, iteration_al + 1, iteration_al)
+
     def cost_al(x, u, t):
       return augmented_lagrangian(x, u, t, dual_equality, dual_inequality,
                                   penalty)
 
-    X, U, obj, gradient, _, _, it = ilqr(
+    X_new, U_new, obj_new, gradient_new, _, _, it = ilqr(
         cost_al,
         dynamics,
         x0,
@@ -659,13 +669,22 @@ def constrained_ilqr(
         alpha_min=alpha_min,
         cost_args=(),
         dynamics_args=dynamics_args,
+        vmap_safe=vmap_safe,
     )
-    iteration_ilqr += int(it)
-    iteration_al += 1
+    iteration_ilqr = torch.where(active_prev, iteration_ilqr + it, iteration_ilqr)
+    update = active_prev
+    X = torch.where(update, X_new, X)
+    U = torch.where(update, U_new, U)
+    obj = torch.where(update, obj_new, obj)
+    gradient = torch.where(update, gradient_new, gradient)
 
     U_pad = pad(U)
-    equality_constraints = eq_mapped(X, U_pad, t_range)
-    inequality_constraints = ineq_mapped(X, U_pad, t_range)
+    equality_constraints_new = eq_mapped(X, U_pad, t_range)
+    inequality_constraints_new = ineq_mapped(X, U_pad, t_range)
+    equality_constraints = torch.where(update, equality_constraints_new,
+                                       equality_constraints)
+    inequality_constraints = torch.where(update, inequality_constraints_new,
+                                         inequality_constraints)
     ineq_proj = inequality_projection(inequality_constraints)
     max_constraint_violation = torch.maximum(
         equality_constraints.abs().amax() if equality_constraints.numel() else torch.zeros(
@@ -674,16 +693,19 @@ def constrained_ilqr(
             (), device=U.device, dtype=U.dtype),
     )
 
-    dual_equality = dual_equality + penalty * equality_constraints
-    dual_inequality = inequality_projection(dual_inequality +
-                                            penalty * inequality_constraints)
-    penalty = penalty * float(penalty_update_rate)
+    dual_equality_new = dual_equality + penalty * equality_constraints
+    dual_inequality_new = inequality_projection(dual_inequality +
+                                                penalty * inequality_constraints)
+    penalty_new = penalty * float(penalty_update_rate)
+    dual_equality = torch.where(update, dual_equality_new, dual_equality)
+    dual_inequality = torch.where(update, dual_inequality_new, dual_inequality)
+    penalty = torch.where(update, penalty_new, penalty)
 
     max_comp_slack = (inequality_constraints * dual_inequality).abs().amax(
     ) if inequality_constraints.numel() else torch.zeros((), device=U.device, dtype=U.dtype)
-    if (float(max_constraint_violation.item()) <= constraints_threshold and
-        float(max_comp_slack.item()) <= constraints_threshold):
-      break
+    converged = (max_constraint_violation <= constraints_threshold) & (
+        max_comp_slack <= constraints_threshold)
+    active = active_prev & (~converged)
 
   return (X, U, dual_equality, dual_inequality, penalty, equality_constraints,
           inequality_constraints, max_constraint_violation, obj, gradient,

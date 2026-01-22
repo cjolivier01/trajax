@@ -189,6 +189,86 @@ class TorchParityTest(absltest.TestCase):
     onp.testing.assert_allclose(onp.asarray(obj_j), float(obj_t.detach().cpu().numpy()), atol=1e-3, rtol=1e-3)
     onp.testing.assert_allclose(onp.asarray(U_j), U_t.detach().cpu().numpy(), atol=1e-2, rtol=1e-2)
 
+  def test_ilqr_vmap_parity_linear_quadratic(self):
+    T, n, m = 12, 3, 2
+    batch = 2
+    rng = onp.random.RandomState(0)
+    A = rng.randn(T, n, n) * 0.05
+    for t in range(T):
+      A[t] += onp.eye(n)
+    B = rng.randn(T, n, m) * 0.1
+    Q = onp.eye(n)
+    R = 0.1 * onp.eye(m)
+    x_goal = rng.randn(n)
+
+    A_j = jnp.asarray(A, dtype=jnp.float64)
+    B_j = jnp.asarray(B, dtype=jnp.float64)
+    Q_j = jnp.asarray(Q, dtype=jnp.float64)
+    R_j = jnp.asarray(R, dtype=jnp.float64)
+    x_goal_j = jnp.asarray(x_goal, dtype=jnp.float64)
+
+    def cost_j(x, u, t):
+      dx = x - x_goal_j
+      stage = 0.5 * (dx @ (Q_j @ dx) + u @ (R_j @ u))
+      final = 10.0 * 0.5 * (dx @ (Q_j @ dx))
+      return jnp.where(t == T, final, stage)
+
+    def dyn_j(x, u, t):
+      return (A_j[t] @ x) + (B_j[t] @ u)
+
+    x0 = rng.randn(batch, n)
+    U0 = rng.randn(batch, T, m) * 0.1
+    solve_j = lambda x0_i, U0_i: jax_optim.ilqr(
+        cost_j,
+        dyn_j,
+        x0_i,
+        U0_i,
+        maxiter=10,
+        alpha_0=1.0,
+        alpha_min=1e-4,
+    )
+    X_j, U_j, obj_j, *_ = jax.vmap(solve_j)(jnp.asarray(x0, dtype=jnp.float64),
+                                            jnp.asarray(U0, dtype=jnp.float64))
+
+    A_t = _to_torch(A)
+    B_t = _to_torch(B)
+    Q_t = _to_torch(Q)
+    R_t = _to_torch(R)
+    x_goal_t = _to_torch(x_goal)
+    T_t = torch.tensor(T, device="cuda", dtype=torch.int64)
+
+    def cost_t(x, u, t):
+      dx = x - x_goal_t
+      stage = 0.5 * (dx @ (Q_t @ dx) + u @ (R_t @ u))
+      final = 10.0 * 0.5 * (dx @ (Q_t @ dx))
+      return torch.where(t == T_t, final, stage)
+
+    def dyn_t(x, u, t):
+      return (A_t[t] @ x) + (B_t[t] @ u)
+
+    def solve_t(x0_i, U0_i):
+      return torch_optim.ilqr(
+          cost_t,
+          dyn_t,
+          x0_i,
+          U0_i,
+          maxiter=10,
+          alpha_0=1.0,
+          alpha_min=1e-4,
+          vmap_safe=True,
+      )
+
+    X_t, U_t, obj_t, *_ = torch.vmap(solve_t)(_to_torch(x0), _to_torch(U0))
+
+    onp.testing.assert_allclose(onp.asarray(obj_j),
+                                obj_t.detach().cpu().numpy(),
+                                atol=1e-3,
+                                rtol=1e-3)
+    onp.testing.assert_allclose(onp.asarray(U_j),
+                                U_t.detach().cpu().numpy(),
+                                atol=1e-2,
+                                rtol=1e-2)
+
 
 if __name__ == "__main__":
   absltest.main()
