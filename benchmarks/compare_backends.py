@@ -366,8 +366,8 @@ def bench_ilqr_linear(T: int, n: int, m: int, maxiter: int, iters: int,
 
 def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
                                   maxiter_ilqr: int, iters: int, warmup: int,
-                                 dtype: str, torch_compile: bool,
-                                 torch_cuda_graph: bool):
+                                  dtype: str, torch_compile: bool,
+                                  torch_cuda_graph: bool):
   rng = onp.random.RandomState(0)
   np_dtype = onp.float32 if dtype == "float32" else onp.float64
   j_dtype = jnp.float32 if dtype == "float32" else jnp.float64
@@ -525,13 +525,46 @@ def bench_constrained_ilqr_linear(T: int, n: int, m: int, maxiter_al: int,
                                         maxiter_al=maxiter_al,
                                         maxiter_ilqr=maxiter_ilqr)[1]
 
-  j_s = _time_jax(j_fn, (x0j,), warmup, iters)
+  # Also report actual iteration counts (helps interpret large maxiter caps).
+  j_info = jax_optim.constrained_ilqr(cost_j,
+                                     dynamics_j,
+                                     x0j,
+                                     U0j,
+                                     equality_constraint=eq_j,
+                                     inequality_constraint=ineq_j,
+                                     maxiter_al=maxiter_al,
+                                     maxiter_ilqr=maxiter_ilqr)
+  j_iter_ilqr = int(onp.asarray(j_info[-2]))
+  j_iter_al = int(onp.asarray(j_info[-1]))
+
   if torch_cuda_graph:
     # `t_fn` returns a scalar time estimate already.
     t_s = float(t_fn(x0t).detach().cpu().numpy())
+    t_iter_ilqr = maxiter_al * maxiter_ilqr
+    t_iter_al = maxiter_al
   else:
+    t_info = torch_optim.constrained_ilqr(cost_t,
+                                         dynamics_t,
+                                         x0t,
+                                         U0t,
+                                         equality_constraint=eq_t,
+                                         inequality_constraint=ineq_t,
+                                         maxiter_al=maxiter_al,
+                                         maxiter_ilqr=maxiter_ilqr)
+    t_iter_ilqr = int(t_info[-2])
+    t_iter_al = int(t_info[-1])
     t_s = _time_torch(t_fn, (x0t,), warmup, iters)
-  return {"jax_s": j_s, "torch_s": t_s, "elements": elems}
+
+  j_s = _time_jax(j_fn, (x0j,), warmup, iters)
+  return {
+      "jax_s": j_s,
+      "torch_s": t_s,
+      "elements": elems,
+      "jax_iter_ilqr": j_iter_ilqr,
+      "jax_iter_al": j_iter_al,
+      "torch_iter_ilqr": t_iter_ilqr,
+      "torch_iter_al": t_iter_al,
+  }
 
 
 def main():
@@ -657,6 +690,9 @@ def main():
   print(f"{args.cmd}: dtype={args.dtype}")
   if "elements" in res:
     print(f"  input elements: {res['elements']:,d}")
+  if "jax_iter_ilqr" in res:
+    print(f"  iters (jax)  : al={res['jax_iter_al']}, ilqr={res['jax_iter_ilqr']}")
+    print(f"  iters (torch): al={res['torch_iter_al']}, ilqr={res['torch_iter_ilqr']}")
   print(f"  jax   : {res['jax_s'] * 1e3:.3f} ms/iter")
   print(f"  torch : {res['torch_s'] * 1e3:.3f} ms/iter")
   print(f"  jax/torch speedup: {speedup:.2f}x")
