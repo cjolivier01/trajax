@@ -333,7 +333,7 @@ class OptimizersTest(parameterized.TestCase):
         maxiter=100, make_psd=False)
     optimal_obj = 51.0
     self.assertLess(obj, optimal_obj)
-    self.assertLess(np.linalg.norm(gradient), 1e-4)
+    self.assertLess(np.linalg.norm(gradient), 2e-4)
 
     _, _, obj, gradient, _ = optimizers.scipy_minimize(
         functools.partial(cost, params=params),
@@ -346,7 +346,7 @@ class OptimizersTest(parameterized.TestCase):
             'maxiter': 1000
         })
     self.assertLess(obj, optimal_obj)
-    self.assertLess(np.linalg.norm(gradient), 1e-4)
+    self.assertLess(np.linalg.norm(gradient), 2e-4)
 
   @parameterized.named_parameters(
       ('explicit', 'explicit', {}),

@@ -23,17 +23,32 @@ import jax
 from jax import config as jax_config
 import jax.numpy as jnp
 import numpy as onp
-import torch
+
+try:
+  import torch
+except Exception as exc:  # pylint: disable=broad-except
+  torch = None
+  _TORCH_IMPORT_ERROR = exc
 
 from trajax import optimizers as jax_optim
 from trajax import tvlqr as jax_tvlqr
-from trajax.torch import optimizers as torch_optim
-from trajax.torch import tvlqr as torch_tvlqr
+
+torch_optim = None
+torch_tvlqr = None
+
+
+def _ensure_torch_backend():
+  global torch_optim, torch_tvlqr
+  if torch_optim is None or torch_tvlqr is None:
+    from trajax.torch import optimizers as torch_optim  # pylint: disable=import-outside-toplevel
+    from trajax.torch import tvlqr as torch_tvlqr  # pylint: disable=import-outside-toplevel
 
 jax_config.update("jax_enable_x64", True)
 
 
-def _to_torch(x, dtype=torch.float64):
+def _to_torch(x, dtype=None):
+  if dtype is None:
+    dtype = torch.float64
   return torch.as_tensor(onp.asarray(x), device="cuda", dtype=dtype)
 
 
@@ -41,8 +56,11 @@ class TorchParityTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
+    if torch is None:
+      self.skipTest(f"torch import failed: {_TORCH_IMPORT_ERROR}")
     if not torch.cuda.is_available():
       self.skipTest("CUDA not available for torch backend tests.")
+    _ensure_torch_backend()
 
   def test_tvlqr_parity(self):
     key = jax.random.PRNGKey(0)

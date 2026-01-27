@@ -19,19 +19,37 @@ from __future__ import division
 from __future__ import print_function
 
 from absl.testing import absltest
-import torch
 
-from trajax.torch import optimizers as torch_optim
+try:
+  import torch
+except Exception as exc:  # pylint: disable=broad-except
+  torch = None
+  _TORCH_IMPORT_ERROR = exc
+
+torch_optim = None
+
+
+def _ensure_torch_backend():
+  global torch_optim
+  if torch_optim is None:
+    from trajax.torch import optimizers as torch_optim  # pylint: disable=import-outside-toplevel
 
 
 class TorchCudaGraphTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
+    if torch is None:
+      self.skipTest(f"torch import failed: {_TORCH_IMPORT_ERROR}")
     if not torch.cuda.is_available():
+<<<<<<< Updated upstream
       self.skipTest("CUDA not available for torch backend tests.")
     if not hasattr(torch, "compile"):
       self.skipTest("torch.compile not available.")
+=======
+      self.skipTest("CUDA not available.")
+    _ensure_torch_backend()
+>>>>>>> Stashed changes
 
   def test_constrained_ilqr_compiled_cuda_graph(self):
     torch.manual_seed(0)
