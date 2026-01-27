@@ -19,6 +19,8 @@ import torch
 from .tvlqr import rollout as tvlqr_rollout
 from .tvlqr import tvlqr
 from .tvlqr import tvlqr_inplace, rollout_inplace
+from ._scan import scan
+from . import _warp_kernels
 
 from torch import _higher_order_ops as _ho
 
@@ -118,6 +120,27 @@ def _rollout(dynamics: Callable[..., torch.Tensor], U: torch.Tensor, x0: torch.T
   return X
 
 
+def _rollout_vmap_safe(
+    dynamics: Callable[..., torch.Tensor],
+    U: torch.Tensor,
+    x0: torch.Tensor,
+    *dynamics_args,
+) -> torch.Tensor:
+  """vmap-safe rollout (no in-place writes to unbatched buffers)."""
+  _require_cuda(U, x0)
+  T = U.shape[0]
+  timesteps = torch.arange(T, device=U.device, dtype=torch.int64)
+
+  def step(x, xs_t):
+    u_t, t = xs_t
+    x_next = dynamics(x, u_t, t, *dynamics_args)
+    # Avoid aliasing between carry and output for HOP capture.
+    return x_next, x_next + 0
+
+  _, x_seq = scan(step, x0, (U, timesteps))
+  return torch.cat([x0.unsqueeze(0), x_seq], dim=0)
+
+
 def evaluate(cost: Callable[..., torch.Tensor], X: torch.Tensor, U: torch.Tensor,
              cost_args: Sequence[Any] = ()) -> torch.Tensor:
   """Evaluates cost(x, u, t) along a trajectory."""
@@ -151,6 +174,28 @@ def adjoint(A: torch.Tensor, B: torch.Tensor, q: torch.Tensor,
     p = A[t].transpose(-1, -2) @ p + q[t]
 
   return g, adj, p
+
+
+def _adjoint_vmap_safe(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    q: torch.Tensor,
+    r: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """vmap-safe adjoint recursion (no in-place writes to unbatched buffers)."""
+  _require_cuda(A, B, q, r)
+  T = q.shape[0] - 1
+  q_stage = q[:T]
+
+  def step(p, xs_t):
+    A_t, B_t, q_t, r_t = xs_t
+    adj_t = p
+    g_t = r_t + B_t.transpose(-1, -2) @ p
+    p_new = A_t.transpose(-1, -2) @ p + q_t
+    return p_new, (g_t + 0, adj_t + 0)
+
+  p0, (g, adj) = scan(step, q[T], (A, B, q_stage, r), reverse=True)
+  return g, adj, p0
 
 
 def grad_wrt_controls(
@@ -227,6 +272,33 @@ def ddp_rollout(
   return Xnew, Unew
 
 
+def _ddp_rollout_vmap_safe(
+    dynamics: Callable[..., torch.Tensor],
+    X: torch.Tensor,
+    U: torch.Tensor,
+    K: torch.Tensor,
+    k: torch.Tensor,
+    alpha: torch.Tensor,
+    dynamics_args: Sequence[Any] = (),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+  """vmap-safe DDP rollout used for iLQR line search."""
+  _require_cuda(X, U, K, k, alpha)
+  T = U.shape[0]
+  timesteps = torch.arange(T, device=U.device, dtype=torch.int64)
+
+  def step(x_new, xs_t):
+    X_t, U_t, K_t, k_t, t = xs_t
+    del_u = alpha * k_t + K_t @ (x_new - X_t)
+    u = U_t + del_u
+    x_next = dynamics(x_new, u, t, *dynamics_args)
+    return x_next, (x_next + 0, u + 0)
+
+  x0 = X[0]
+  _, (x_seq, u_seq) = scan(step, x0, (X[:-1], U, K, k, timesteps))
+  Xnew = torch.cat([x0.unsqueeze(0), x_seq], dim=0)
+  return Xnew, u_seq
+
+
 def _total_cost(cost: Callable[..., torch.Tensor], X: torch.Tensor, U: torch.Tensor,
                 cost_args: Sequence[Any]) -> torch.Tensor:
   return evaluate(cost, X, pad(U), cost_args=cost_args).sum()
@@ -245,6 +317,7 @@ def line_search_ddp(
     alpha_0: float = 1.0,
     alpha_min: float = 0.00005,
     max_steps: int = 12,
+    ddp_rollout_fn: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = ddp_rollout,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   """Fixed-budget line search over DDP rollouts (GPU-only control flow)."""
   obj_safe = torch.where(torch.isnan(obj), torch.tensor(float("inf"),
@@ -262,13 +335,13 @@ def line_search_ddp(
   obj_cands = []
   for i in range(max_steps):
     alpha = alphas[i]
-    Xnew, Unew = ddp_rollout(dynamics,
-                             X,
-                             U,
-                             K,
-                             k,
-                             alpha,
-                             dynamics_args=dynamics_args)
+    Xnew, Unew = ddp_rollout_fn(dynamics,
+                                X,
+                                U,
+                                K,
+                                k,
+                                alpha,
+                                dynamics_args=dynamics_args)
     obj_new = _total_cost(cost, Xnew, Unew, cost_args)
     obj_new = torch.where(torch.isnan(obj_new), obj_safe, obj_new)
     X_cands.append(Xnew)
@@ -282,18 +355,21 @@ def line_search_ddp(
   chosen_idx = torch.where(any_improved, first_idx,
                            torch.zeros((), device=U.device, dtype=torch.int64))
 
-  chosen_obj = obj_stack[chosen_idx]
+  chosen_obj = obj_cands[0]
+  chosen_alpha = alphas[0]
   X_chosen = X_cands[0]
   U_chosen = U_cands[0]
   for i in range(max_steps):
     mask = (chosen_idx == i)
     X_chosen = torch.where(mask, X_cands[i], X_chosen)
     U_chosen = torch.where(mask, U_cands[i], U_chosen)
+    chosen_obj = torch.where(mask, obj_cands[i], chosen_obj)
+    chosen_alpha = torch.where(mask, alphas[i], chosen_alpha)
 
   X_out = torch.where(any_improved, X_chosen, X)
   U_out = torch.where(any_improved, U_chosen, U)
   obj_out = torch.where(any_improved, chosen_obj, obj_safe)
-  alpha_out = 0.5 * alphas[chosen_idx]
+  alpha_out = 0.5 * chosen_alpha
   return X_out, U_out, obj_out, alpha_out
 
 
@@ -323,6 +399,7 @@ def ilqr(
     dynamics_args: Sequence[Any] = (),
     static_loop: bool = False,
     vmap_safe: bool = False,
+    early_exit: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            Tuple[torch.Tensor, ...], torch.Tensor]:
   """Iterative LQR (iLQR) in PyTorch.
@@ -332,12 +409,37 @@ def ilqr(
   Note: the iteration count is returned as a scalar tensor to keep the control
   flow compatible with torch.vmap / torch.compile. The loop always runs a fixed
   maxiter with masked updates (static_loop/vmap_safe retained for compatibility).
+
+  If `early_exit=True`, the solver uses `torch._higher_order_ops.while_loop` to
+  exit as soon as its stopping criteria are met (inference-only, not vmap-safe).
   """
   _require_cuda(x0, U)
+  if early_exit:
+    if vmap_safe:
+      raise ValueError("`early_exit=True` is not compatible with `vmap_safe=True`.")
+    return _ilqr_early_exit(
+        cost,
+        dynamics,
+        x0,
+        U,
+        maxiter=maxiter,
+        grad_norm_threshold=grad_norm_threshold,
+        relative_grad_norm_threshold=relative_grad_norm_threshold,
+        obj_step_threshold=obj_step_threshold,
+        inputs_step_threshold=inputs_step_threshold,
+        make_psd=make_psd,
+        psd_delta=psd_delta,
+        alpha_0=alpha_0,
+        alpha_min=alpha_min,
+        cost_args=cost_args,
+        dynamics_args=dynamics_args,
+    )
   T = U.shape[0]
   n = x0.shape[0]
 
   roll = partial(_rollout, dynamics)
+  if vmap_safe:
+    roll = partial(_rollout_vmap_safe, dynamics)
   quadratizer = quadratize(cost)
   dynamics_jacobians = linearize(dynamics)
   cost_gradients = linearize(cost)
@@ -362,7 +464,9 @@ def ilqr(
 
   lqr = get_lqr_params(X, U)
   _, q, _, r, _, A, B = lqr
-  gradient, adjoints, _ = adjoint(A, B, q, torch.cat([r, torch.zeros_like(r[:1])], dim=0))
+  adjoint_fn = _adjoint_vmap_safe if vmap_safe else adjoint
+  gradient, adjoints, _ = adjoint_fn(
+      A, B, q, torch.cat([r, torch.zeros_like(r[:1])], dim=0))
   grad_norm_initial = torch.linalg.vector_norm(gradient)
   grad_norm_initial_safe = torch.where(torch.isnan(grad_norm_initial),
                                        torch.tensor(0.0,
@@ -389,23 +493,30 @@ def ilqr(
     iteration_count = torch.where(active_prev, iteration_count + 1, iteration_count)
     Q, q, R, r, M, A, B = lqr
     # Solve LQR subproblem.
-    K, kk, _, _ = tvlqr(Q, q, R, r, M, A, B, c)
+    if vmap_safe:
+      K, kk, _, _ = tvlqr(Q, q, R, r, M, A, B, c, solver="solve", use_scan=True)
+    else:
+      K, kk, _, _ = tvlqr(Q, q, R, r, M, A, B, c)
 
-    X_new, U_new, obj_new, alpha = line_search_ddp(cost,
-                                                   dynamics,
-                                                   X,
-                                                   U,
-                                                   K,
-                                                   kk,
-                                                   obj,
-                                                   cost_args=cost_args,
-                                                   dynamics_args=dynamics_args,
-                                                   alpha_0=alpha_0,
-                                                   alpha_min=alpha_min)
+    rollout_fn = _ddp_rollout_vmap_safe if vmap_safe else ddp_rollout
+    X_new, U_new, obj_new, alpha = line_search_ddp(
+        cost,
+        dynamics,
+        X,
+        U,
+        K,
+        kk,
+        obj,
+        cost_args=cost_args,
+        dynamics_args=dynamics_args,
+        alpha_0=alpha_0,
+        alpha_min=alpha_min,
+        ddp_rollout_fn=rollout_fn,
+    )
 
     # Gradient based on current linearization.
     r_pad = torch.cat([r, torch.zeros_like(r[:1])], dim=0)
-    gradient, adjoints, _ = adjoint(A, B, q, r_pad)
+    gradient, adjoints, _ = adjoint_fn(A, B, q, r_pad)
     grad_norm = torch.linalg.vector_norm(gradient)
     grad_norm = torch.where(torch.isnan(grad_norm),
                             torch.tensor(float("inf"),
@@ -429,6 +540,135 @@ def ilqr(
     active = update
 
   return X, U, obj, gradient, adjoints, lqr, iteration_count
+
+
+def _ilqr_early_exit(
+    cost: Callable[..., torch.Tensor],
+    dynamics: Callable[..., torch.Tensor],
+    x0: torch.Tensor,
+    U: torch.Tensor,
+    maxiter: int,
+    grad_norm_threshold: float,
+    relative_grad_norm_threshold: float,
+    obj_step_threshold: float,
+    inputs_step_threshold: float,
+    make_psd: bool,
+    psd_delta: float,
+    alpha_0: float,
+    alpha_min: float,
+    cost_args: Sequence[Any],
+    dynamics_args: Sequence[Any],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           Tuple[torch.Tensor, ...], torch.Tensor]:
+  """iLQR variant that stops early via `torch._higher_order_ops.while_loop`."""
+  _require_cuda(x0, U)
+  T = U.shape[0]
+  n = x0.shape[0]
+
+  roll = partial(_rollout, dynamics)
+  quadratizer = quadratize(cost)
+  dynamics_jacobians = linearize(dynamics)
+  cost_gradients = linearize(cost)
+
+  X0 = roll(U, x0, *dynamics_args)
+  timesteps = torch.arange(X0.shape[0], device=X0.device, dtype=torch.int64)
+  obj0 = _total_cost(cost, X0, U, cost_args)
+
+  psd = torch.vmap(partial(project_psd_cone, delta=psd_delta))
+
+  def get_lqr_params(X_in: torch.Tensor, U_in: torch.Tensor):
+    Q, R, M = quadratizer(X_in, pad(U_in), timesteps, *cost_args)
+    if make_psd:
+      Q = psd(Q)
+      R = psd(R)
+    q, r = cost_gradients(X_in, pad(U_in), timesteps, *cost_args)
+    dyn_timesteps = torch.arange(T, device=U_in.device, dtype=torch.int64)
+    A, B = dynamics_jacobians(X_in[:-1], U_in, dyn_timesteps, *dynamics_args)
+    return (Q, q, R[:T], r[:T], M[:T], A, B)
+
+  c = torch.zeros((T, n), device=U.device, dtype=U.dtype)
+
+  lqr0 = get_lqr_params(X0, U)
+  _, q0, _, r0, _, A0, B0 = lqr0
+  r0_pad = torch.cat([r0, torch.zeros_like(r0[:1])], dim=0)
+  gradient0, adjoints0, _ = adjoint(A0, B0, q0, r0_pad)
+  grad_norm_initial = torch.linalg.vector_norm(gradient0)
+  grad_norm_initial_safe = torch.where(torch.isnan(grad_norm_initial),
+                                       torch.tensor(0.0,
+                                                    device=U.device,
+                                                    dtype=U.dtype),
+                                       grad_norm_initial)
+  grad_norm_threshold_t = torch.as_tensor(grad_norm_threshold,
+                                          device=U.device,
+                                          dtype=U.dtype)
+  rel_grad_norm_threshold_t = torch.as_tensor(relative_grad_norm_threshold,
+                                              device=U.device,
+                                              dtype=U.dtype)
+  grad_norm_threshold_t = torch.maximum(
+      grad_norm_threshold_t,
+      rel_grad_norm_threshold_t * (grad_norm_initial_safe + 1.0),
+  )
+
+  active0 = ~(grad_norm_initial <= grad_norm_threshold_t)
+
+  def cond_fn(it, _X, _U, _obj, _lqr, _gradient, _adjoints, active):
+    return (it < maxiter) & active
+
+  def body_fn(it, X_in, U_in, obj_in, lqr_in, _gradient, _adjoints, _active):
+    Q, q, R, r, M, A, B = lqr_in
+    # `lstsq` is not `torch.compile` friendly; use a static-shape solve.
+    K, kk, _, _ = tvlqr(Q, q, R, r, M, A, B, c, solver="solve")
+
+    X_new, U_new, obj_new, alpha = line_search_ddp(cost,
+                                                   dynamics,
+                                                   X_in,
+                                                   U_in,
+                                                   K,
+                                                   kk,
+                                                   obj_in,
+                                                   cost_args=cost_args,
+                                                   dynamics_args=dynamics_args,
+                                                   alpha_0=alpha_0,
+                                                   alpha_min=alpha_min)
+
+    r_pad = torch.cat([r, torch.zeros_like(r[:1])], dim=0)
+    gradient, adjoints, _ = adjoint(A, B, q, r_pad)
+    grad_norm = torch.linalg.vector_norm(gradient)
+    grad_norm = torch.where(torch.isnan(grad_norm),
+                            torch.tensor(float("inf"),
+                                         device=U.device,
+                                         dtype=U.dtype), grad_norm)
+
+    lqr_new = get_lqr_params(X_new, U_new)
+    U_step = torch.linalg.vector_norm(U_new - U_in)
+    obj_step = torch.abs(obj_new - obj_in)
+
+    still_improving_obj = obj_step > obj_step_threshold * (torch.abs(obj_new) + 1.0)
+    still_moving_U = U_step > inputs_step_threshold * (torch.linalg.vector_norm(U_new) + 1.0)
+    still_progressing = still_improving_obj & still_moving_U
+    has_potential = (grad_norm > grad_norm_threshold_t) & still_progressing & (alpha > alpha_min)
+
+    X_out = torch.where(has_potential, X_new, X_in)
+    U_out = torch.where(has_potential, U_new, U_in)
+    obj_out = torch.where(has_potential, obj_new, obj_in)
+    lqr_out = tuple(torch.where(has_potential, new, old)
+                    for new, old in zip(lqr_new, lqr_in))
+    active_out = has_potential
+    return (it + 1, X_out, U_out, obj_out, lqr_out, gradient, adjoints, active_out)
+
+  init = (
+      torch.zeros((), device=U.device, dtype=torch.int64),
+      X0,
+      U,
+      obj0,
+      lqr0,
+      gradient0,
+      adjoints0,
+      active0,
+  )
+  it, X, U, obj, lqr, gradient, adjoints, _active = _ho.while_loop(cond_fn, body_fn,
+                                                                   init)
+  return X, U, obj, gradient, adjoints, lqr, it
 
 
 def default_cem_hyperparams() -> Dict[str, float]:
@@ -578,6 +818,7 @@ def constrained_ilqr(
     cost_args: Sequence[Any] = (),
     dynamics_args: Sequence[Any] = (),
     vmap_safe: bool = False,
+    early_exit: bool = False,
 ):
   """Constrained iLQR via an augmented Lagrangian outer loop (GPU-first).
 
@@ -586,8 +827,14 @@ def constrained_ilqr(
 
   Note: iteration counts are returned as scalar tensors to keep the control
   flow compatible with torch.vmap / torch.compile.
+
+  If `early_exit=True`, the inner iLQR solve exits early via
+  `torch._higher_order_ops.while_loop` (not vmap-safe). The outer augmented
+  Lagrangian loop remains fixed-iteration and uses masked updates.
   """
   _require_cuda(x0, U)
+  if early_exit and vmap_safe:
+    raise ValueError("`early_exit=True` is not compatible with `vmap_safe=True`.")
   if equality_constraint is None:
     equality_constraint = lambda x, u, t, *args: torch.zeros(
         (0,), device=x.device, dtype=x.dtype)
@@ -670,6 +917,7 @@ def constrained_ilqr(
         cost_args=(),
         dynamics_args=dynamics_args,
         vmap_safe=vmap_safe,
+        early_exit=early_exit,
     )
     iteration_ilqr = torch.where(active_prev, iteration_ilqr + it, iteration_ilqr)
     update = active_prev
@@ -766,7 +1014,7 @@ def constrained_ilqr_linear_quadratic_box(
       y = x_next + 0  # avoid scan aliasing
       return x_next, y
 
-    _, ys = _ho.scan(step, x0, (U_in, timesteps))
+    _, ys = scan(step, x0, (U_in, timesteps))
     return torch.cat([x0.unsqueeze(0), ys], dim=0)
 
   def constraints(X_in: torch.Tensor, U_in: torch.Tensor,
@@ -1001,6 +1249,7 @@ def constrained_ilqr_linear_quadratic_box_graphable(
     penalty_update_rate: float = 10.0,
     final_weight: float = 0.0,
     delta: float = 1.0e-6,
+    use_warp: bool = False,
 ):
   """CUDA-graphable constrained LQ solver (fixed loops, in-place buffers).
 
@@ -1009,8 +1258,11 @@ def constrained_ilqr_linear_quadratic_box_graphable(
     - no `.item()` / Python early-exit
     - writes results into `workspace` buffers
 
+  If `use_warp=True`, uses NVIDIA Warp for a fused box-constraint inequality +
+  active-set kernel (requires `warp-lang` and `float32`).
+
   The problem class matches `constrained_ilqr_linear` benchmark:
-    dynamics: x[t+1] = A @ x[t] + B @ u[t]
+    dynamics: x[t+1] = A[t] @ x[t] + B[t] @ u[t] (or time-invariant A/B)
     cost: 0.5 * (x^T Q x + u^T R u)
     equality constraint: x[T] == x_goal
     inequality constraint: |u[t]| <= umax
@@ -1023,14 +1275,34 @@ def constrained_ilqr_linear_quadratic_box_graphable(
   m = workspace.m
   if U0.shape != (T, m) or x0.shape != (n,):
     raise ValueError("Input shapes do not match workspace.")
+  if use_warp:
+    # This path is best-effort and not guaranteed to be torch.compile-safe.
+    if workspace.dtype != torch.float32:
+      raise ValueError("`use_warp=True` currently requires float32 workspace.")
+    if not _warp_kernels.is_available():
+      raise RuntimeError("Warp is not available (install `warp-lang`).")
 
   # Initialize state.
   workspace.U.copy_(U0)
   workspace.X[0].copy_(x0)
-  workspace.A_seq.copy_(A.unsqueeze(0).expand(T, n, n))
-  workspace.B_seq.copy_(B.unsqueeze(0).expand(T, n, m))
+  if A.ndim == 2:
+    workspace.A_seq.copy_(A.unsqueeze(0).expand(T, n, n))
+  elif A.shape == (T, n, n):
+    workspace.A_seq.copy_(A)
+  else:
+    raise ValueError(f"`A` must have shape ({n}, {n}) or ({T}, {n}, {n}), got {tuple(A.shape)}")
+  if B.ndim == 2:
+    workspace.B_seq.copy_(B.unsqueeze(0).expand(T, n, m))
+  elif B.shape == (T, n, m):
+    workspace.B_seq.copy_(B)
+  else:
+    raise ValueError(f"`B` must have shape ({n}, {m}) or ({T}, {n}, {m}), got {tuple(B.shape)}")
   for t in range(T):
-    workspace.X[t + 1].copy_(A @ workspace.X[t] + B @ workspace.U[t])
+    # Prefer 2D matmuls (GEMM) over `mv` for better compiler coverage.
+    x_t = workspace.X[t].unsqueeze(-1)  # (n, 1)
+    u_t = workspace.U[t].unsqueeze(-1)  # (m, 1)
+    x_next = (workspace.A_seq[t] @ x_t) + (workspace.B_seq[t] @ u_t)
+    workspace.X[t + 1].copy_(x_next.squeeze(-1))
 
   workspace.dual_eq.zero_()
   workspace.dual_ineq.zero_()
@@ -1051,17 +1323,21 @@ def constrained_ilqr_linear_quadratic_box_graphable(
   for _ in range(maxiter_al):
     # Fixed inner loop (active-set stabilization).
     for _ in range(maxiter_ilqr):
-      # U_pad = [U; 0]
-      workspace.U_pad[:T].copy_(workspace.U)
-      workspace.U_pad[T].zero_()
+      if use_warp:
+        _warp_kernels.box_ineq_active_inplace(workspace.U, umax, workspace.dual_ineq,
+                                              workspace.ineq, workspace.active)
+      else:
+        # U_pad = [U; 0]
+        workspace.U_pad[:T].copy_(workspace.U)
+        workspace.U_pad[T].zero_()
 
-      # ineq = [u-umax, -u-umax]
-      workspace.ineq[:, :m].copy_(workspace.U_pad).sub_(umax)
-      workspace.ineq[:, m:].copy_(workspace.U_pad).neg_().sub_(umax)
+        # ineq = [u-umax, -u-umax]
+        workspace.ineq[:, :m].copy_(workspace.U_pad).sub_(umax)
+        workspace.ineq[:, m:].copy_(workspace.U_pad).neg_().sub_(umax)
 
-      # active set for augmented term: active if dual!=0 or ineq>=0
-      workspace.active.copy_(
-          ~((workspace.dual_ineq.abs() <= 0.0) & (workspace.ineq < 0.0)))
+        # active set for augmented term: active if dual!=0 or ineq>=0
+        workspace.active.copy_(
+            ~((workspace.dual_ineq.abs() <= 0.0) & (workspace.ineq < 0.0)))
 
       # Build R_seq, r_seq for current dual/active set.
       workspace.a1.copy_(workspace.active[:T, :m].to(workspace.dtype))
@@ -1084,7 +1360,23 @@ def constrained_ilqr_linear_quadratic_box_graphable(
           float(final_weight) * Qx_goal).add_(-workspace.penalty * x_goal)
 
       # Solve TVLQR and roll out the optimal policy.
-      if workspace._tvlqr_inplace_compiled is None:
+      use_compiled_tvlqr = (workspace._tvlqr_inplace_compiled is not None) and (
+          not torch._dynamo.is_compiling())
+      if use_compiled_tvlqr:
+        workspace._tvlqr_inplace_compiled(workspace.Q_seq,
+                                          workspace.q_seq,
+                                          workspace.R_seq,
+                                          workspace.r_seq,
+                                          workspace.M_seq,
+                                          workspace.A_seq,
+                                          workspace.B_seq,
+                                          workspace.c_seq,
+                                          workspace.K,
+                                          workspace.k,
+                                          workspace.P,
+                                          workspace.p,
+                                          workspace.I_m)
+      else:
         tvlqr_inplace(workspace.Q_seq,
                       workspace.q_seq,
                       workspace.R_seq,
@@ -1100,20 +1392,6 @@ def constrained_ilqr_linear_quadratic_box_graphable(
                       delta=delta,
                       I_m=workspace.I_m,
                       solver="solve")
-      else:
-        workspace._tvlqr_inplace_compiled(workspace.Q_seq,
-                                          workspace.q_seq,
-                                          workspace.R_seq,
-                                          workspace.r_seq,
-                                          workspace.M_seq,
-                                          workspace.A_seq,
-                                          workspace.B_seq,
-                                          workspace.c_seq,
-                                          workspace.K,
-                                          workspace.k,
-                                          workspace.P,
-                                          workspace.p,
-                                          workspace.I_m)
       rollout_inplace(workspace.K,
                       workspace.k,
                       x0,
@@ -1132,10 +1410,14 @@ def constrained_ilqr_linear_quadratic_box_graphable(
     workspace.eq.zero_()
     workspace.eq[T].copy_(workspace.X[T]).sub_(x_goal)
 
-    workspace.U_pad[:T].copy_(workspace.U)
-    workspace.U_pad[T].zero_()
-    workspace.ineq[:, :m].copy_(workspace.U_pad).sub_(umax)
-    workspace.ineq[:, m:].copy_(workspace.U_pad).neg_().sub_(umax)
+    if use_warp:
+      _warp_kernels.box_ineq_active_inplace(workspace.U, umax, workspace.dual_ineq,
+                                            workspace.ineq, workspace.active)
+    else:
+      workspace.U_pad[:T].copy_(workspace.U)
+      workspace.U_pad[T].zero_()
+      workspace.ineq[:, :m].copy_(workspace.U_pad).sub_(umax)
+      workspace.ineq[:, m:].copy_(workspace.U_pad).neg_().sub_(umax)
 
     torch.clamp(workspace.ineq, min=0.0, out=workspace.ineq_pos)
     max_violation = torch.maximum(workspace.eq.abs().amax(),

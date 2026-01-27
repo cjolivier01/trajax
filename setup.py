@@ -45,6 +45,8 @@ setup(
     extras_require={
         # GPU-first PyTorch backend (installed separately in many environments).
         'torch': ['torch>=2.1', 'triton'],
+        # Optional CUDA kernels via NVIDIA Warp (`trajax/torch/_warp_kernels.py`).
+        'warp': ['warp-lang'],
         # Experimental SQP modules (used by tests under trajax/experimental/sqp).
         'sqp': ['cvxpy>=1.4', 'ecos'],
     },

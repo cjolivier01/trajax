@@ -2,8 +2,8 @@
 
 This module provides:
   - a robust eager-mode path using `torch.linalg.lstsq` (matches JAX behavior),
-  - a compile/control-flow friendly path using `torch._higher_order_ops.scan`
-    plus `torch.linalg.solve` (static output shapes).
+  - a compile/control-flow friendly path using a scan wrapper plus
+    `torch.linalg.solve` (static output shapes).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Callable, Literal, Tuple
 
 import torch
 
-from torch import _higher_order_ops as _ho
+from ._scan import scan
 
 _Solver = Literal["lstsq", "solve"]
 
@@ -46,14 +46,18 @@ def rollout(
 
     def step(x, xs_t):
       K_t, k_t, A_t, B_t, c_t, t = xs_t
-      u = K_t @ x + k_t
-      x_next = A_t @ x + B_t @ u + c_t
+      # Prefer 2D matmuls (GEMM) over `mv` for better compiler coverage.
+      x_col = x.unsqueeze(-1)  # (n, 1)
+      u_col = (K_t @ x_col) + k_t.unsqueeze(-1)  # (m, 1)
+      x_next_col = (A_t @ x_col) + (B_t @ u_col) + c_t.unsqueeze(-1)  # (n, 1)
+      u = u_col.squeeze(-1)
+      x_next = x_next_col.squeeze(-1)
       # Avoid aliasing between carry and outputs.
       y = torch.cat([x_next, u], dim=0) + 0
       return x_next, y
 
     xs = (K, k, A, B, c, timesteps)
-    _, y = _ho.scan(step, x0, xs)
+    _, y = scan(step, x0, xs)
     X = torch.cat([x0.unsqueeze(0), y[:, :n]], dim=0)
     U = y[:, n:].contiguous()
     return X, U
@@ -62,9 +66,12 @@ def rollout(
   U = torch.empty((T, m), device=x0.device, dtype=x0.dtype)
   X[0] = x0
   for t in range(T):
-    u = K[t] @ X[t] + k[t]
-    X[t + 1] = A[t] @ X[t] + B[t] @ u + c[t]
-    U[t] = u
+    # Prefer 2D matmuls (GEMM) over `mv` for better compiler coverage.
+    x_col = X[t].unsqueeze(-1)  # (n, 1)
+    u_col = (K[t] @ x_col) + k[t].unsqueeze(-1)  # (m, 1)
+    x_next_col = (A[t] @ x_col) + (B[t] @ u_col) + c[t].unsqueeze(-1)  # (n, 1)
+    X[t + 1] = x_next_col.squeeze(-1)
+    U[t] = u_col.squeeze(-1)
   return X, U
 
 
@@ -214,9 +221,12 @@ def rollout_inplace(
 
   X_out[0].copy_(x0)
   for t in range(T):
-    u = K[t] @ X_out[t] + k[t]
-    X_out[t + 1].copy_(A[t] @ X_out[t] + B[t] @ u + c[t])
-    U_out[t].copy_(u)
+    # Prefer 2D matmuls (GEMM) over `mv` for better compiler coverage.
+    x_col = X_out[t].unsqueeze(-1)  # (n, 1)
+    u_col = (K[t] @ x_col) + k[t].unsqueeze(-1)  # (m, 1)
+    x_next_col = (A[t] @ x_col) + (B[t] @ u_col) + c[t].unsqueeze(-1)  # (n, 1)
+    X_out[t + 1].copy_(x_next_col.squeeze(-1))
+    U_out[t].copy_(u_col.squeeze(-1))
   return X_out, U_out
 
 
@@ -310,7 +320,7 @@ def tvlqr(
   q_stage = q[:T].contiguous()
   xs = (Q_stage, q_stage, R.contiguous(), r.contiguous(), M.contiguous(),
         A.contiguous(), B.contiguous(), c.contiguous())
-  (_, _), (P_seq, p_seq, K_seq, k_seq) = _ho.scan(combine, init, xs, reverse=True)
+  (_, _), (P_seq, p_seq, K_seq, k_seq) = scan(combine, init, xs, reverse=True)
 
   P = torch.cat([P_seq, Q[T].unsqueeze(0)], dim=0)
   p = torch.cat([p_seq, q[T].unsqueeze(0)], dim=0)

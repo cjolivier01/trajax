@@ -15,11 +15,12 @@ def scan(
     fn: Callable[[Any, Any], Tuple[Any, Any]],
     init: Any,
     xs: Any,
+    reverse: bool = False,
 ):
   if hasattr(torch, "_higher_order_ops") and hasattr(torch._higher_order_ops,
                                                    "scan"):
     try:
-      return torch._higher_order_ops.scan(fn, init, xs)
+      return torch._higher_order_ops.scan(fn, init, xs, reverse=reverse)
     except Exception:
       # Fall back to eager loop if `scan` can't be compiled (e.g. unsupported
       # ops like `lstsq` in the scan body).
@@ -38,9 +39,16 @@ def scan(
 
   carry = init
   outs = []
-  for i in range(length):
+  if reverse:
+    idxs = range(length - 1, -1, -1)
+  else:
+    idxs = range(length)
+
+  for i in idxs:
     carry, out = fn(carry, get_i(i))
     outs.append(out)
+  if reverse:
+    outs.reverse()
 
   def stack_out(o_list):
     if isinstance(o_list[0], torch.Tensor):

@@ -41,6 +41,10 @@ includes a CUDA-graphable fixed-iteration variant:
 `trajax.torch.optimizers.constrained_ilqr_linear_quadratic_box_graphable`
 (use `workspace.compile_for_cuda_graph()` before capture).
 
+Optionally, this fixed-iteration box solver can use NVIDIA Warp for a fused
+inequality + active-set kernel (`use_warp=True`, requires `float32` tensors).
+Install Warp with `pip install -e '.[warp]'`.
+
 ## Installation
 
 To install directly from github using `pip`:
