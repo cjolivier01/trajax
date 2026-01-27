@@ -398,7 +398,7 @@ def ilqr(
     cost_args: Sequence[Any] = (),
     dynamics_args: Sequence[Any] = (),
     static_loop: bool = False,
-    vmap_safe: bool = False,
+    vmap_safe: bool = True,
     early_exit: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            Tuple[torch.Tensor, ...], torch.Tensor]:
@@ -415,8 +415,8 @@ def ilqr(
   """
   _require_cuda(x0, U)
   if early_exit:
-    if vmap_safe:
-      raise ValueError("`early_exit=True` is not compatible with `vmap_safe=True`.")
+    # Early-exit uses `while_loop` and is not vmap-safe; override `vmap_safe`.
+    vmap_safe = False
     return _ilqr_early_exit(
         cost,
         dynamics,
@@ -817,7 +817,7 @@ def constrained_ilqr(
     alpha_min: float = 0.00005,
     cost_args: Sequence[Any] = (),
     dynamics_args: Sequence[Any] = (),
-    vmap_safe: bool = False,
+    vmap_safe: bool = True,
     early_exit: bool = False,
 ):
   """Constrained iLQR via an augmented Lagrangian outer loop (GPU-first).
@@ -833,8 +833,9 @@ def constrained_ilqr(
   Lagrangian loop remains fixed-iteration and uses masked updates.
   """
   _require_cuda(x0, U)
-  if early_exit and vmap_safe:
-    raise ValueError("`early_exit=True` is not compatible with `vmap_safe=True`.")
+  if early_exit:
+    # The inner solve is not vmap-safe; override `vmap_safe`.
+    vmap_safe = False
   if equality_constraint is None:
     equality_constraint = lambda x, u, t, *args: torch.zeros(
         (0,), device=x.device, dtype=x.dtype)
@@ -845,7 +846,10 @@ def constrained_ilqr(
   horizon = U.shape[0] + 1
   t_range = torch.arange(horizon, device=U.device, dtype=torch.int64)
 
-  X = rollout(dynamics, U, x0, dynamics_args=dynamics_args)
+  if vmap_safe:
+    X = _rollout_vmap_safe(dynamics, U, x0, *dynamics_args)
+  else:
+    X = rollout(dynamics, U, x0, dynamics_args=dynamics_args)
 
   eq_mapped = vectorize(lambda x, u, t: equality_constraint(x, u, t, *cost_args))
   ineq_mapped = vectorize(
@@ -1249,7 +1253,7 @@ def constrained_ilqr_linear_quadratic_box_graphable(
     penalty_update_rate: float = 10.0,
     final_weight: float = 0.0,
     delta: float = 1.0e-6,
-    use_warp: bool = False,
+    use_warp: bool | None = None,
 ):
   """CUDA-graphable constrained LQ solver (fixed loops, in-place buffers).
 
@@ -1268,6 +1272,10 @@ def constrained_ilqr_linear_quadratic_box_graphable(
     inequality constraint: |u[t]| <= umax
   """
   _require_cuda(x0, U0, A, B, Q, R, x_goal, umax)
+  if use_warp is None:
+    # Default to Warp when available, but never use it under `torch.compile`.
+    use_warp = (_warp_kernels.is_available() and workspace.dtype == torch.float32 and
+                (not torch._dynamo.is_compiling()))
   if x0.device != workspace.device or x0.dtype != workspace.dtype:
     raise ValueError("workspace device/dtype must match inputs.")
   T = workspace.T

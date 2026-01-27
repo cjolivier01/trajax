@@ -36,13 +36,17 @@ For CUDA graph capture, the Torch TVLQR path exposes in-place variants
 `trajax.torch.tvlqr.tvlqr_inplace` and `trajax.torch.tvlqr.rollout_inplace`
 that write into user-provided buffers.
 
+Torch `ilqr` defaults to a vmap-safe implementation (`vmap_safe=True`) so it can
+be used inside `torch.vmap` without extra flags.
+
 For constrained LQ problems with box constraints, the Torch backend also
 includes a CUDA-graphable fixed-iteration variant:
 `trajax.torch.optimizers.constrained_ilqr_linear_quadratic_box_graphable`
 (use `workspace.compile_for_cuda_graph()` before capture).
 
 Optionally, this fixed-iteration box solver can use NVIDIA Warp for a fused
-inequality + active-set kernel (`use_warp=True`, requires `float32` tensors).
+inequality + active-set kernel (enabled by default when `warp-lang` is
+installed and tensors are `float32`; disable with `use_warp=False`).
 Install Warp with `pip install -e '.[warp]'`.
 
 ## Installation
